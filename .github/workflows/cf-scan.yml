@@ -3,7 +3,7 @@ name: CF IP Auto Select (mcis)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'  # 北京时间每天凌晨2点
+    - cron: '0 18 * * *'
 
 jobs:
   scan:
@@ -21,25 +21,19 @@ jobs:
         run: |
           echo "=== 下载 Monte Carlo IP Searcher ==="
           
-          # 下载 v0.2.4 版本
           wget -q https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v0.2.4/mcis-v0.2.4-linux-amd64.tar.gz
           
-          # 检查下载是否成功
           if [ ! -f mcis-v0.2.4-linux-amd64.tar.gz ]; then
             echo "❌ 下载失败"
             exit 1
           fi
           
           echo "✅ 下载完成，正在解压..."
-          
-          # 解压
           tar -xzf mcis-v0.2.4-linux-amd64.tar.gz
           
-          # 列出解压出的文件
           echo "解压出的文件："
           ls -la
           
-          # 查找可执行文件（通常是 mcis）
           if [ -f mcis ]; then
             chmod +x mcis
             echo "✅ 可执行文件: mcis"
@@ -58,25 +52,36 @@ jobs:
           
           # 合并你的 CIDR（如果存在）
           if [ -f ipv4cidr.txt ]; then
-            echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
-            cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr.txt
+            echo "你的 CIDR 原始行数: $(wc -l < ipv4cidr.txt)"
+            
+            # === 清洗 CIDR 文件 ===
+            # 只保留标准 CIDR 格式（x.x.x.x/xx）
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' ipv4cidr.txt > ipv4cidr_clean.txt
+            echo "清洗后 CIDR 行数: $(wc -l < ipv4cidr_clean.txt)"
+            
+            # 显示被过滤掉的行（帮助排查问题）
+            echo "=== 被过滤的异常行（前 5 个） ==="
+            grep -v -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' ipv4cidr.txt | head -5 || echo "无异常行"
+            
+            cat official_cidr.txt ipv4cidr_clean.txt | sort -u > all_cidr.txt
           else
             cp official_cidr.txt all_cidr.txt
           fi
           
           echo "合并后 CIDR 数量: $(wc -l < all_cidr.txt)"
+          
+          echo "=== 预览前 5 行 ==="
+          head -5 all_cidr.txt
 
       - name: Run mcis - Smart Search
         run: |
           echo "=== mcis 智能搜索（预算: 2000 次探测） ==="
           
-          # 亚太地区机房码
           COLO_LIST="HKG,TPE,NRT,KIX,ITM,FUK,ICN,SIN,BKK,HAN,SGN,MNL,CGK,KUL,RGN,PNH,BOM,DEL,MAA,BLR,HYD,CCU,SYD,MEL,BNE,PER,AKL"
           
-          # 运行 mcis
           ./mcis \
             -cidr-file all_cidr.txt \
-            -budget 2000 \
+            -budget 5000 \
             -top 30 \
             -concurrency 100 \
             -timeout 3s \
@@ -92,7 +97,6 @@ jobs:
           echo ""
           echo "=== mcis 搜索完成 ==="
           
-          # 检查结果文件
           if [ ! -f mcis_result.jsonl ]; then
             echo "❌ 未生成结果文件"
             exit 1
@@ -119,7 +123,6 @@ jobs:
           
           DEFAULT_PORT = "443"
           
-          # 读取 mcis 结果
           results = []
           if not os.path.exists('mcis_result.jsonl'):
               print("❌ 未找到 mcis_result.jsonl")
@@ -135,7 +138,6 @@ jobs:
           
           if len(results) == 0:
               print("❌ 没有搜索到符合条件的 IP")
-              # 生成空文件避免后续步骤报错
               with open('Test_ip/best_20.txt', 'w') as f:
                   f.write("# No IPs found\n")
               with open('Test_ip/result_IP.txt', 'w') as f:
