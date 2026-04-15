@@ -114,7 +114,7 @@ jobs:
             -download-mode sequential \
             -download-bytes 10485760 \
             -download-timeout 15s \
-            -download-url https://ftp.nl.netbsd.org/pub/pub/test/100mb.bin \
+            -download-url http://speedtest.tele2.net/100MB.zip \
             -out jsonl \
             -out-file mcis_result.jsonl \
             -v
