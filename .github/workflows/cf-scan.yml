@@ -3,7 +3,7 @@ name: CF IP Auto Select (mcis)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 * * *'  # 北京时间每天凌晨2点
 
 jobs:
   scan:
@@ -21,34 +21,42 @@ jobs:
         run: |
           echo "=== 下载 Monte Carlo IP Searcher ==="
           
-          # 方案1：直接下载固定版本（推荐）
-          wget -q https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v0.2.4/mcis-v0.2.4-linux-amd64
+          # 下载 v0.2.4 版本
+          wget -q https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v0.2.4/mcis-v0.2.4-linux-amd64.tar.gz
           
           # 检查下载是否成功
-          if [ ! -f mcis_linux_amd64 ] || [ ! -s mcis_linux_amd64 ]; then
-            echo "⚠️ GitHub Releases 下载失败，尝试备用方案..."
-            
-            # 方案2：使用 curl 重试
-            curl -L -o mcis_linux_amd64 https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v1.0.0/mcis_linux_amd64
-          fi
-          
-          # 再次检查
-          if [ ! -f mcis_linux_amd64 ] || [ ! -s mcis_linux_amd64 ]; then
-            echo "❌ 下载失败，请检查网络或手动下载"
+          if [ ! -f mcis-v0.2.4-linux-amd64.tar.gz ]; then
+            echo "❌ 下载失败"
             exit 1
           fi
           
-          chmod +x mcis_linux_amd64
-          echo "✅ 下载完成"
-          ls -la mcis_linux_amd64
+          echo "✅ 下载完成，正在解压..."
+          
+          # 解压
+          tar -xzf mcis-v0.2.4-linux-amd64.tar.gz
+          
+          # 列出解压出的文件
+          echo "解压出的文件："
+          ls -la
+          
+          # 查找可执行文件（通常是 mcis）
+          if [ -f mcis ]; then
+            chmod +x mcis
+            echo "✅ 可执行文件: mcis"
+          else
+            echo "❌ 未找到可执行文件 mcis"
+            exit 1
+          fi
 
       - name: Prepare CIDR File
         run: |
           echo "=== 准备 CIDR 文件 ==="
           
+          # 下载官方 IPv4 列表
           wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
           echo "官方 CIDR: $(wc -l < official_cidr.txt)"
           
+          # 合并你的 CIDR（如果存在）
           if [ -f ipv4cidr.txt ]; then
             echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
             cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr.txt
@@ -62,9 +70,11 @@ jobs:
         run: |
           echo "=== mcis 智能搜索（预算: 2000 次探测） ==="
           
+          # 亚太地区机房码
           COLO_LIST="HKG,TPE,NRT,KIX,ITM,FUK,ICN,SIN,BKK,HAN,SGN,MNL,CGK,KUL,RGN,PNH,BOM,DEL,MAA,BLR,HYD,CCU,SYD,MEL,BNE,PER,AKL"
           
-          ./mcis_linux_amd64 \
+          # 运行 mcis
+          ./mcis \
             -cidr-file all_cidr.txt \
             -budget 2000 \
             -top 30 \
@@ -81,6 +91,12 @@ jobs:
           
           echo ""
           echo "=== mcis 搜索完成 ==="
+          
+          # 检查结果文件
+          if [ ! -f mcis_result.jsonl ]; then
+            echo "❌ 未生成结果文件"
+            exit 1
+          fi
 
       - name: Process Results - Generate Top 20
         run: |
@@ -89,6 +105,7 @@ jobs:
           cat > process_result.py << 'EOF'
           import json
           import csv
+          import os
           
           COLO_MAP = {
               "HKG": "香港", "TPE": "台北", "NRT": "东京", "KIX": "大阪",
@@ -105,7 +122,7 @@ jobs:
           # 读取 mcis 结果
           results = []
           if not os.path.exists('mcis_result.jsonl'):
-              print("❌ 未找到 mcis_result.jsonl，可能搜索失败")
+              print("❌ 未找到 mcis_result.jsonl")
               exit(1)
           
           with open('mcis_result.jsonl', 'r') as f:
@@ -115,6 +132,15 @@ jobs:
           
           print(f"读取到 {len(results)} 个 IP")
           print("")
+          
+          if len(results) == 0:
+              print("❌ 没有搜索到符合条件的 IP")
+              # 生成空文件避免后续步骤报错
+              with open('Test_ip/best_20.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              with open('Test_ip/result_IP.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              exit(0)
           
           def sort_key(r):
               if r.get('download_mbps', 0) > 0:
@@ -180,12 +206,15 @@ jobs:
           echo "=========================================="
           echo "📁 Test_ip 目录内容"
           echo "=========================================="
-          ls -la Test_ip/
+          ls -la Test_ip/ || echo "目录为空"
           echo ""
-          echo "=========================================="
-          echo "📄 result_IP.txt 内容预览"
-          echo "=========================================="
-          head -10 Test_ip/result_IP.txt
+          
+          if [ -f Test_ip/result_IP.txt ]; then
+            echo "=========================================="
+            echo "📄 result_IP.txt 内容预览"
+            echo "=========================================="
+            head -10 Test_ip/result_IP.txt
+          fi
 
       - name: Commit and Push Results
         run: |
