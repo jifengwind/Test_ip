@@ -30,31 +30,78 @@ jobs:
           chmod +x CloudflareST
           echo "✅ 下载完成"
 
-      - name: Prepare CIDR File
+      - name: Prepare and Clean CIDR File
         run: |
-          echo "=== 准备 CIDR 文件 ==="
+          echo "=== 准备并清理 CIDR 文件 ==="
           
+          # 下载官方列表
           wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
           echo "官方 CIDR: $(wc -l < official_cidr.txt)"
           
-          if [ -f ipv4cidr.txt ]; then
-            echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
-            cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr_raw.txt
-          else
-            cp official_cidr.txt all_cidr_raw.txt
-          fi
+          # 合并并清理
+          cat > clean_cidr.py << 'EOF'
+          import ipaddress
           
-          echo "合并后原始 CIDR: $(wc -l < all_cidr_raw.txt)"
+          valid_cidrs = set()
+          invalid_count = 0
+          
+          # 读取官方列表
+          with open('official_cidr.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  try:
+                      net = ipaddress.ip_network(line, strict=False)
+                      valid_cidrs.add(str(net))
+                  except:
+                      invalid_count += 1
+          
+          # 读取你的列表（如果存在）
+          try:
+              with open('ipv4cidr.txt', 'r') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or line.startswith('#'):
+                          continue
+                      try:
+                          net = ipaddress.ip_network(line, strict=False)
+                          valid_cidrs.add(str(net))
+                      except:
+                          invalid_count += 1
+          except FileNotFoundError:
+              pass
+          
+          # 写入清理后的文件
+          with open('all_cidr_clean.txt', 'w') as f:
+              for cidr in sorted(valid_cidrs):
+                  f.write(cidr + '\n')
+          
+          print(f"✅ 有效 CIDR: {len(valid_cidrs)}")
+          print(f"❌ 无效 CIDR: {invalid_count}")
+          EOF
+          
+          python3 clean_cidr.py
+          
+          echo "清理后 CIDR 数量: $(wc -l < all_cidr_clean.txt)"
           
           # 随机采样 2000 个，加速扫描
-          shuf -n 2000 all_cidr_raw.txt > all_cidr.txt
-          echo "随机采样后 CIDR: $(wc -l < all_cidr.txt)"
+          shuf -n 2000 all_cidr_clean.txt > all_cidr.txt 2>/dev/null || cp all_cidr_clean.txt all_cidr.txt
+          echo "采样后 CIDR 数量: $(wc -l < all_cidr.txt)"
+          
+          if [ ! -s all_cidr.txt ]; then
+            echo "❌ 没有有效的 CIDR"
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== 预览前 5 行 ==="
+          head -5 all_cidr.txt
 
       - name: Run CloudflareST - Delay Test
         run: |
           echo "=== 延迟测速（取前 30 个） ==="
           
-          # 只测延迟，不测下载
           ./CloudflareST \
             -f all_cidr.txt \
             -n 30 \
@@ -100,21 +147,21 @@ jobs:
                       latency = 0
                   
                   try:
-                      loss = float(row.get('丢包率', '0').strip().rstrip('%') or '0')
+                      loss_str = row.get('丢包率', '0').strip().rstrip('%')
+                      loss = float(loss_str) if loss_str else 0
                   except:
                       loss = 0
                   
                   results.append({
                       'ip': ip,
                       'latency': latency,
-                      'loss': loss,
-                      'port': row.get('端口', '443').strip() or '443'
+                      'loss': loss
                   })
           
           print(f"读取到 {len(results)} 个 IP")
           
           if len(results) == 0:
-              print("❌ 没有搜索到符合条件的 IP")
+              print("❌ 没有符合条件的 IP")
               with open('Test_ip/best_20.txt', 'w') as f:
                   f.write("# No IPs found\n")
               with open('Test_ip/result_IP.txt', 'w') as f:
@@ -123,10 +170,8 @@ jobs:
                   f.write("IP 地址,端口,延迟(ms),丢包率(%)\n")
               exit(0)
           
-          # 按延迟升序排序
+          # 按延迟升序
           results.sort(key=lambda x: x['latency'])
-          
-          # 取前 20 个
           top20 = results[:20]
           
           print("")
