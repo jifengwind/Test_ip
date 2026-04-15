@@ -1,4 +1,4 @@
-name: CF IP Auto Select (Asia + CacheFly)
+name: CF IP Auto Select (TCPing + CacheFly)
 
 on:
   workflow_dispatch:  # 手动触发
@@ -29,41 +29,45 @@ jobs:
           echo "原始 CIDR 数量: $(wc -l < ipv4cidr.txt)"
           echo "过滤后 CIDR 数量: $(wc -l < cf_cidr.txt)"
 
-      - name: Step 1 - 境外延迟粗筛（仅亚太地区）
+      - name: Step 1 - TCPing 延迟粗筛
         run: |
-          echo "=== 第1步：延迟扫描，仅保留亚太地区节点 ==="
-          echo "目标地区: 东京(NRT)、新加坡(SIN)、香港(HKG)、大阪(KIX)、首尔(ICN)"
+          echo "=== 第1步：TCPing 延迟扫描 ==="
+          # 改用 TCP 模式，不用 httping，稳定很多
+          ./CloudflareST -f cf_cidr.txt -n 500 -t 8 -tl 300 -sl 5 -dn 0
           
-          # -httping 模式可获取 colo 信息，配合 -cfcolo 筛选亚太地区
-          ./CloudflareST -f cf_cidr.txt -n 300 -t 6 -tl 400 -sl 5 -dn 0 \
-            -httping \
-            -cfcolo NRT,SIN,HKG,KIX,ICN
+          # 确保 result.csv 存在
+          if [ ! -f result.csv ]; then
+            echo "❌ 未找到任何可用 IP，请检查 CIDR 文件"
+            exit 1
+          fi
           
-          awk -F ',' 'NR>1 {print $1}' result.csv > step1_300.txt
-          echo "保留 $(wc -l < step1_300.txt) 个 IP（亚太地区）"
+          awk -F ',' 'NR>1 {print $1}' result.csv > step1_500.txt
+          echo "保留 $(wc -l < step1_500.txt) 个 IP（延迟 < 300ms）"
 
-      - name: Step 2 - 反向排除美国直连
+      - name: Step 2 - 剔除美西直连（延迟 < 2ms）
         run: |
           echo "=== 第2步：剔除美国超低延迟 IP ==="
           awk -F ',' 'NR>1 && $2 >= 2.0 {print $1}' result.csv > step2_filtered.txt
-          if [ $(wc -l < step2_filtered.txt) -lt 5 ]; then
+          
+          if [ ! -s step2_filtered.txt ] || [ $(wc -l < step2_filtered.txt) -lt 5 ]; then
             echo "⚠️ 剔除后 IP 太少，改用 step1 结果"
-            cp step1_300.txt step2_filtered.txt
+            cp step1_500.txt step2_filtered.txt
           fi
+          
           echo "剩余 $(wc -l < step2_filtered.txt) 个 IP"
 
       - name: Step 3 - 延迟排序取前30个
         run: |
           echo "=== 第3步：按延迟排序，取前30个 ==="
-          ./CloudflareST -f step2_filtered.txt -n 30 -t 6 -tl 400 -sl 5 -dn 0
+          ./CloudflareST -f step2_filtered.txt -n 30 -t 6 -tl 300 -sl 5 -dn 0
+          
           awk -F ',' 'NR>1 {print $1}' result.csv > final_30.txt
           echo "保留 $(wc -l < final_30.txt) 个 IP"
 
       - name: Step 4 - CacheFly 下载测速
         run: |
           echo "=== 第4步：CacheFly 下载速度实测 ==="
-          # 用 CacheFly 的 100MB 测试文件，测 8 秒
-          ./CloudflareST -f final_30.txt -n 10 -t 4 -tl 400 -sl 5 -dn 8 \
+          ./CloudflareST -f final_30.txt -n 10 -t 4 -tl 300 -sl 5 -dn 8 \
             -url http://cachefly.cachefly.net/100mb.test
           
           echo ""
@@ -72,7 +76,6 @@ jobs:
 
       - name: Step 5 - 输出最优 IP
         run: |
-          # 优先取下载速度最快的，如果下载速度都是0，则取延迟最低的
           BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
           BEST_SPEED=$(awk -F ',' 'NR==2 {print $6}' result.csv)
           BEST_DELAY=$(awk -F ',' 'NR==2 {print $5}' result.csv)
@@ -88,18 +91,16 @@ jobs:
           
           echo $BEST_IP > best_ip.txt
 
-      - name: Step 6 - 备选：如果下载测速全0，改用延迟最优
+      - name: Step 6 - 备选：下载测速全0则用延迟
         run: |
-          # 检查是否所有下载速度都是 0.00
-          ZERO_COUNT=$(awk -F ',' 'NR>1 && $6 == "0.00" {count++} END {print count}' result.csv)
-          TOTAL_COUNT=$(awk -F ',' 'NR>1 {count++} END {print count}' result.csv)
+          ZERO_COUNT=$(awk -F ',' 'NR>1 && $6 == "0.00" {count++} END {print count+0}' result.csv)
+          TOTAL_COUNT=$(awk -F ',' 'NR>1 {count++} END {print count+0}' result.csv)
           
-          if [ "$ZERO_COUNT" -eq "$TOTAL_COUNT" ] 2>/dev/null; then
+          if [ "$ZERO_COUNT" -eq "$TOTAL_COUNT" ] && [ "$TOTAL_COUNT" -gt 0 ]; then
             echo ""
             echo "⚠️ 所有 IP 下载速度均为 0，改用延迟排序结果"
             
-            # 重新按延迟排序
-            ./CloudflareST -f final_30.txt -n 1 -t 4 -tl 400 -sl 5 -dn 0
+            ./CloudflareST -f final_30.txt -n 1 -t 4 -tl 300 -sl 5 -dn 0
             
             BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
             BEST_DELAY=$(awk -F ',' 'NR==2 {print $5}' result.csv)
@@ -120,4 +121,3 @@ jobs:
             best_ip.txt
             result.csv
             final_30.txt
-            step2_filtered.txt
