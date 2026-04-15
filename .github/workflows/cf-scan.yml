@@ -1,4 +1,4 @@
-name: CF IP Auto Select (TCPing + CacheFly)
+name: CF IP Auto Select (Asia Strict)
 
 on:
   workflow_dispatch:  # 手动触发
@@ -29,46 +29,60 @@ jobs:
           echo "原始 CIDR 数量: $(wc -l < ipv4cidr.txt)"
           echo "过滤后 CIDR 数量: $(wc -l < cf_cidr.txt)"
 
-      - name: Step 1 - TCPing 延迟粗筛
+      - name: Step 1 - TCPing 延迟扫描
         run: |
-          echo "=== 第1步：TCPing 延迟扫描 ==="
-          # 改用 TCP 模式，不用 httping，稳定很多
-          ./CloudflareST -f cf_cidr.txt -n 500 -t 8 -tl 300 -sl 5 -dn 0
+          echo "=== 第1步：全量延迟扫描 ==="
+          # 延迟上限放宽到 300ms，尽量多留一些候选
+          ./CloudflareST -f cf_cidr.txt -n 1000 -t 8 -tl 300 -sl 5 -dn 0
           
-          # 确保 result.csv 存在
           if [ ! -f result.csv ]; then
-            echo "❌ 未找到任何可用 IP，请检查 CIDR 文件"
+            echo "❌ 未找到任何可用 IP"
             exit 1
           fi
           
-          awk -F ',' 'NR>1 {print $1}' result.csv > step1_500.txt
-          echo "保留 $(wc -l < step1_500.txt) 个 IP（延迟 < 300ms）"
+          awk -F ',' 'NR>1 {print $1}' result.csv > step1_all.txt
+          echo "扫描到 $(wc -l < step1_all.txt) 个可用 IP"
 
-      - name: Step 2 - 剔除美西直连（延迟 < 2ms）
+      - name: Step 2 - 强制剔除北美/欧洲（延迟 < 120ms）
         run: |
-          echo "=== 第2步：剔除美国超低延迟 IP ==="
-          awk -F ',' 'NR>1 && $2 >= 2.0 {print $1}' result.csv > step2_filtered.txt
+          echo "=== 第2步：强制剔除延迟 < 120ms 的 IP ==="
+          echo "说明：从美西测，< 120ms 必为北美/欧洲，直接删除"
           
-          if [ ! -s step2_filtered.txt ] || [ $(wc -l < step2_filtered.txt) -lt 5 ]; then
-            echo "⚠️ 剔除后 IP 太少，改用 step1 结果"
-            cp step1_500.txt step2_filtered.txt
+          awk -F ',' 'NR>1 && $2 >= 120 {print $1}' result.csv > step2_asia.txt
+          
+          ASIA_COUNT=$(wc -l < step2_asia.txt)
+          echo "延迟 >= 120ms 的 IP 数量: $ASIA_COUNT"
+          
+          if [ "$ASIA_COUNT" -lt 5 ]; then
+            echo ""
+            echo "❌ 疑似亚太的 IP 太少（只有 $ASIA_COUNT 个）"
+            echo "可能原因：你的 CIDR 文件里大部分是美西 IP"
+            echo ""
+            echo "建议：换一个包含更多亚太广播地址的 CIDR 文件"
+            exit 1
           fi
           
-          echo "剩余 $(wc -l < step2_filtered.txt) 个 IP"
+          echo "保留 $ASIA_COUNT 个 IP（疑似亚太地区）"
 
       - name: Step 3 - 延迟排序取前30个
         run: |
           echo "=== 第3步：按延迟排序，取前30个 ==="
-          ./CloudflareST -f step2_filtered.txt -n 30 -t 6 -tl 300 -sl 5 -dn 0
+          ./CloudflareST -f step2_asia.txt -n 30 -t 6 -tl 300 -sl 5 -dn 0
           
           awk -F ',' 'NR>1 {print $1}' result.csv > final_30.txt
-          echo "保留 $(wc -l < final_30.txt) 个 IP"
+          
+          echo "=== 候选 IP 预览（延迟最低的10个） ==="
+          head -11 result.csv | column -t -s ','
+          echo ""
+          echo "保留 $(wc -l < final_30.txt) 个 IP 进入下载测速"
 
-      - name: Step 4 - CacheFly 下载测速
+      - name: Step 4 - 下载测速（换源）
         run: |
-          echo "=== 第4步：CacheFly 下载速度实测 ==="
+          echo "=== 第4步：下载速度实测 ==="
+          echo "测速源: speedtest.tele2.net (欧洲源，对亚太较友好)"
+          
           ./CloudflareST -f final_30.txt -n 10 -t 4 -tl 300 -sl 5 -dn 8 \
-            -url http://cachefly.cachefly.net/100mb.test
+            -url http://speedtest.tele2.net/100MB.zip
           
           echo ""
           echo "=== 测速结果（按下载速度排序） ==="
@@ -121,3 +135,4 @@ jobs:
             best_ip.txt
             result.csv
             final_30.txt
+            step2_asia.txt
