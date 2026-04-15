@@ -1,9 +1,9 @@
-name: CF IP Auto Select (Merged Sources)
+name: CF IP Auto Select (Speed Only)
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'  # 北京时间每天凌晨2点
+    - cron: '0 18 * * *'
 
 jobs:
   scan:
@@ -26,92 +26,50 @@ jobs:
         run: |
           echo "=== 合并多个 IP 源 ==="
           
-          # 下载官方 IPv4 列表
           wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
           echo "官方 CIDR 数量: $(wc -l < official_cidr.txt)"
           
-          # 检查你的 CIDR 文件是否存在
           if [ -f ipv4cidr.txt ]; then
             echo "你的 CIDR 数量: $(wc -l < ipv4cidr.txt)"
-            # 合并并去重
             cat official_cidr.txt ipv4cidr.txt | sort -u > merged_cidr.txt
           else
-            echo "⚠️ 未找到 ipv4cidr.txt，仅使用官方列表"
             cp official_cidr.txt merged_cidr.txt
           fi
           
           echo "合并后 CIDR 数量: $(wc -l < merged_cidr.txt)"
           
-          # 过滤 Cloudflare 常见 IP 段（可选，加速扫描）
           grep -E "^(1\.|5\.|8\.|23\.|31\.|45\.|64\.|66\.|72\.|77\.|89\.|104\.|141\.|147\.|162\.|172\.|173\.|185\.|188\.|190\.|191\.|192\.|193\.|194\.|195\.|197\.|198\.|199\.|212\.)" merged_cidr.txt > cf_cidr.txt 2>/dev/null || cp merged_cidr.txt cf_cidr.txt
           
           echo "过滤后 CIDR 数量: $(wc -l < cf_cidr.txt)"
 
-      - name: Step 1 - TCPing 延迟粗筛
+      - name: Step 1 - 延迟粗筛（只要连通性）
         run: |
-          echo "=== 第1步：延迟扫描（上限 250ms） ==="
-          echo "说明：从美西测，150-250ms 大概率是亚太节点"
-          
-          ./CloudflareST -f cf_cidr.txt -n 500 -t 8 -tl 250 -sl 5 -dn 0
+          echo "=== 第1步：延迟粗筛（只淘汰超时的） ==="
+          # 延迟上限放宽到 500ms，只淘汰完全不通的
+          ./CloudflareST -f cf_cidr.txt -n 300 -t 8 -tl 500 -sl 5 -dn 0
           
           if [ ! -f result.csv ]; then
             echo "❌ 未找到任何可用 IP"
             exit 1
           fi
           
-          awk -F ',' 'NR>1 {print $1}' result.csv > step1_500.txt
-          echo "保留 $(wc -l < step1_500.txt) 个 IP（延迟 < 250ms）"
+          awk -F ',' 'NR>1 {print $1}' result.csv > step1_300.txt
+          echo "保留 $(wc -l < step1_300.txt) 个可用 IP"
 
-      - name: Step 2 - 剔除北美/欧洲（延迟 < 100ms）
+      - name: Step 2 - 下载测速精选
         run: |
-          echo "=== 第2步：剔除延迟 < 100ms 的 IP ==="
-          echo "说明：从美西测，< 100ms 的基本是北美或欧洲"
-          
-          awk -F ',' 'NR>1 && $2 >= 100 {print $1}' result.csv > step2_asia.txt
-          
-          ASIA_COUNT=$(wc -l < step2_asia.txt)
-          echo "延迟 >= 100ms 的 IP 数量: $ASIA_COUNT"
-          
-          if [ "$ASIA_COUNT" -lt 5 ]; then
-            echo "⚠️ 亚太 IP 太少，放宽条件到 >= 80ms"
-            awk -F ',' 'NR>1 && $2 >= 80 {print $1}' result.csv > step2_asia.txt
-            ASIA_COUNT=$(wc -l < step2_asia.txt)
-            echo "延迟 >= 80ms 的 IP 数量: $ASIA_COUNT"
-          fi
-          
-          if [ "$ASIA_COUNT" -lt 3 ]; then
-            echo "❌ 亚太 IP 仍然不足，请检查 CIDR 文件"
-            exit 1
-          fi
-          
-          echo "保留 $ASIA_COUNT 个 IP（疑似亚太地区）"
-
-      - name: Step 3 - 延迟排序取前30个
-        run: |
-          echo "=== 第3步：按延迟排序，取前30个 ==="
-          
-          ./CloudflareST -f step2_asia.txt -n 30 -t 6 -tl 250 -sl 5 -dn 0
-          
-          awk -F ',' 'NR>1 {print $1}' result.csv > final_30.txt
-          
-          echo "=== 候选 IP 预览（前10个） ==="
-          head -11 result.csv | column -t -s ','
-          echo ""
-          echo "保留 $(wc -l < final_30.txt) 个 IP 进入下载测速"
-
-      - name: Step 4 - 下载测速
-        run: |
-          echo "=== 第4步：下载速度实测 ==="
+          echo "=== 第2步：下载速度实测（核心筛选） ==="
           echo "测速源: speedtest.tele2.net"
           
-          ./CloudflareST -f final_30.txt -n 10 -t 4 -tl 250 -sl 5 -dn 8 \
+          # 直接用延迟粗筛的结果测下载速度，取前 10 个
+          ./CloudflareST -f step1_300.txt -n 10 -t 4 -tl 500 -sl 5 -dn 10 \
             -url http://speedtest.tele2.net/100MB.zip
           
           echo ""
           echo "=== 测速结果（按下载速度排序） ==="
           head -11 result.csv | column -t -s ','
 
-      - name: Step 5 - 输出最优 IP
+      - name: Step 3 - 输出最优 IP
         run: |
           BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
           BEST_SPEED=$(awk -F ',' 'NR==2 {print $6}' result.csv)
@@ -125,10 +83,12 @@ jobs:
           echo "📊 平均延迟: $BEST_DELAY ms"
           echo "📉 丢包率: $BEST_LOSS"
           echo "=========================================="
+          echo ""
+          echo "💡 说明：此 IP 在境外测速中下载速度最快，国内访问大概率也不差"
           
           echo $BEST_IP > best_ip.txt
 
-      - name: Step 6 - 备选：下载测速全0则用延迟
+      - name: Step 4 - 备选：下载测速全0则用延迟
         run: |
           ZERO_COUNT=$(awk -F ',' 'NR>1 && $6 == "0.00" {count++} END {print count+0}' result.csv)
           TOTAL_COUNT=$(awk -F ',' 'NR>1 {count++} END {print count+0}' result.csv)
@@ -137,7 +97,7 @@ jobs:
             echo ""
             echo "⚠️ 所有 IP 下载速度均为 0，改用延迟排序结果"
             
-            ./CloudflareST -f final_30.txt -n 1 -t 4 -tl 250 -sl 5 -dn 0
+            ./CloudflareST -f step1_300.txt -n 1 -t 4 -tl 500 -sl 5 -dn 0
             
             BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
             BEST_DELAY=$(awk -F ',' 'NR==2 {print $5}' result.csv)
@@ -157,5 +117,4 @@ jobs:
           path: |
             best_ip.txt
             result.csv
-            final_30.txt
-            step2_asia.txt
+            step1_300.txt
