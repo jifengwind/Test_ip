@@ -46,11 +46,9 @@ jobs:
         run: |
           echo "=== 准备 CIDR 文件 ==="
           
-          # 下载官方 IPv4 列表
           wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
           echo "官方 CIDR: $(wc -l < official_cidr.txt)"
           
-          # 合并你的 CIDR（如果存在）
           if [ -f ipv4cidr.txt ]; then
             echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
             cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr_raw.txt
@@ -101,15 +99,14 @@ jobs:
         run: |
           echo "=== mcis 智能搜索（预算: 5000 次探测） ==="
           
-          # 不再限制地区，全量搜索
           ./mcis \
             -cidr-file all_cidr.txt \
             -budget 5000 \
             -top 30 \
             -concurrency 80 \
-            -timeout 3s \
+            -timeout 2s \
             -host speed.cloudflare.com \
-            -download-top 20 \
+            -download-top 30 \
             -download-bytes 10485760 \
             -download-timeout 15s \
             -download-url http://cachefly.cachefly.net/100mb.test \
@@ -119,7 +116,6 @@ jobs:
           
           echo ""
           
-          # 检查结果
           if [ ! -f mcis_result.jsonl ]; then
             echo "❌ 未生成结果文件"
             exit 1
@@ -157,22 +153,23 @@ jobs:
           
           DEFAULT_PORT = "443"
           
-          results = []
           if not os.path.exists('mcis_result.jsonl'):
               print("❌ 未找到 mcis_result.jsonl")
               exit(1)
           
+          # 读取所有结果
+          all_results = []
           with open('mcis_result.jsonl', 'r') as f:
               for line in f:
                   if line.strip():
                       try:
-                          results.append(json.loads(line))
+                          all_results.append(json.loads(line))
                       except:
                           continue
           
-          print(f"读取到 {len(results)} 个 IP")
+          print(f"读取到 {len(all_results)} 个 IP")
           
-          if len(results) == 0:
+          if len(all_results) == 0:
               print("❌ 没有搜索到符合条件的 IP")
               with open('Test_ip/best_20.txt', 'w') as f:
                   f.write("# No IPs found\n")
@@ -182,25 +179,35 @@ jobs:
                   f.write("IP 地址,端口,延迟(ms),下载(MB/s),下载(Mbps),线路,地区码\n")
               exit(0)
           
-          # 排序：优先按下载速度降序，其次按延迟升序
-          def sort_key(r):
-              download_mbps = r.get('download_mbps', 0) or 0
-              latency = r.get('latency_ms', 999) or 999
-              
-              if download_mbps > 0:
-                  # 有下载速度：按速度降序
-                  return (-download_mbps, latency)
-              else:
-                  # 无下载速度：按延迟升序
-                  return (0, latency)
+          # 分类：下载成功 vs 下载失败
+          download_ok = []
+          download_fail = []
           
-          results.sort(key=sort_key)
+          for r in all_results:
+              if r.get('download_ok'):
+                  download_ok.append(r)
+              else:
+                  download_fail.append(r)
+          
+          # 成功的按下载速度降序
+          download_ok.sort(key=lambda x: x.get('download_mbps', 0), reverse=True)
+          
+          # 失败的按延迟升序
+          download_fail.sort(key=lambda x: x.get('latency_ms', 999) if x.get('latency_ms') else 999)
+          
+          # 合并：先成功的，后失败的
+          results = download_ok + download_fail
+          
+          print(f"下载成功: {len(download_ok)} 个")
+          print(f"下载失败: {len(download_fail)} 个")
+          
+          # 取前 20 个
           top20 = results[:20]
           
           print("")
           print("=== 最终前 20 个 IP ===")
-          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'下载(MB/s)':<12} {'线路':<14}")
-          print("-" * 68)
+          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'下载(MB/s)':<12} {'线路':<14} {'状态':<6}")
+          print("-" * 78)
           
           for i, r in enumerate(top20, 1):
               ip = r.get('ip', '')
@@ -209,9 +216,10 @@ jobs:
               download_mbs = download_mbps / 8 if download_mbps > 0 else 0
               colo = r.get('colo', '') or ''
               line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
+              status = "✅" if r.get('download_ok') else "⚠️"
               
               speed_str = f"{download_mbs:.1f}" if download_mbs > 0 else "-"
-              print(f"{i:<4} {ip:<18} {latency:<10} {speed_str:<12} {line:<14}")
+              print(f"{i:<4} {ip:<18} {latency:<10} {speed_str:<12} {line:<14} {status:<6}")
           
           # 保存 best_20.txt
           with open('Test_ip/best_20.txt', 'w') as f:
@@ -235,7 +243,7 @@ jobs:
           # 保存 result.csv
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
-              writer.writerow(['IP 地址', '端口', '延迟(ms)', '下载(MB/s)', '下载(Mbps)', '线路', '地区码'])
+              writer.writerow(['IP 地址', '端口', '延迟(ms)', '下载(MB/s)', '下载(Mbps)', '线路', '地区码', '下载成功'])
               for r in top20:
                   ip = r['ip']
                   latency = r.get('latency_ms', 0) or 0
@@ -243,12 +251,8 @@ jobs:
                   download_mbs = download_mbps / 8 if download_mbps > 0 else 0
                   colo = r.get('colo', '') or ''
                   line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-                  writer.writerow([ip, DEFAULT_PORT, latency, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo])
-          
-          # 保存 best_ip.txt
-          if top20:
-              with open('Test_ip/best_ip.txt', 'w') as f:
-                  f.write(f"{top20[0]['ip']}\n")
+                  ok = "是" if r.get('download_ok') else "否"
+                  writer.writerow([ip, DEFAULT_PORT, latency, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo, ok])
           
           print("")
           print(f"✅ 已保存前 20 个 IP 到 Test_ip 目录")
@@ -278,14 +282,6 @@ jobs:
             echo "📄 best_20.txt 内容预览"
             echo "=========================================="
             head -10 Test_ip/best_20.txt
-          fi
-          
-          if [ -f Test_ip/best_ip.txt ]; then
-            echo ""
-            echo "=========================================="
-            echo "🏆 最优 IP"
-            echo "=========================================="
-            cat Test_ip/best_ip.txt
           fi
 
       - name: Commit and Push Results
