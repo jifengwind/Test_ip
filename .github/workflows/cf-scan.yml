@@ -1,4 +1,4 @@
-name: CF IP Auto Select (No API)
+name: CF IP Auto Select (Ping.cn)
 
 on:
   workflow_dispatch:
@@ -8,11 +8,19 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests beautifulsoup4
 
       - name: Download CloudflareST
         run: |
@@ -27,7 +35,7 @@ jobs:
 
       - name: Step 1 - 境外延迟扫描
         run: |
-          echo "=== 第1步：延迟扫描（取前100个） ==="
+          echo "=== 第1步：境外延迟扫描 ==="
           ./CloudflareST -f cf_cidr.txt -n 100 -t 8 -tl 400 -sl 5 -dn 0
           awk -F ',' 'NR>1 {print $1}' result.csv > step1_100.txt
           echo "保留 $(wc -l < step1_100.txt) 个 IP"
@@ -41,20 +49,156 @@ jobs:
           fi
           echo "剩余 $(wc -l < step2_filtered.txt) 个 IP"
 
-      - name: Step 3 - 下载速度实测（模拟国内）
+      - name: Step 3 - 压缩到 15 个
         run: |
-          echo "=== 第3步：下载速度测试 ==="
-          # 用 CloudflareST 自带的下载测速，测 10 秒
-          ./CloudflareST -f step2_filtered.txt -n 10 -t 4 -tl 400 -sl 5 -dn 10 -url https://speed.cloudflare.com/__down?bytes=104857600
-          echo "=== 测速结果（按下载速度排序） ==="
-          head -11 result.csv | column -t -s ','
+          echo "=== 第3步：取前15个 ==="
+          ./CloudflareST -f step2_filtered.txt -n 15 -t 8 -tl 400 -sl 5 -dn 0
+          awk -F ',' 'NR>1 {print $1}' result.csv > final_15.txt
+          echo "最终保留 $(wc -l < final_15.txt) 个 IP"
 
-      - name: Step 4 - 选出最优
+      - name: Step 4 - Ping.cn 国内测速
         run: |
+          echo "=== 第4步：Ping.cn 国内节点测速 ==="
+          cat > pingcn_batch.py << 'EOF'
+          import requests
+          import time
+          import json
+          import sys
+          import re
+          from bs4 import BeautifulSoup
+
+          def pingcn_test(ip):
+              s = requests.Session()
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Referer': 'https://ping.chinaz.com/',
+                  'Origin': 'https://ping.chinaz.com'
+              })
+              
+              try:
+                  # 1. 获取页面，拿到 token
+                  resp = s.get(f'https://ping.chinaz.com/{ip}', timeout=15)
+                  soup = BeautifulSoup(resp.text, 'html.parser')
+                  
+                  # 查找 token（藏在 meta 或 input 里）
+                  token = None
+                  meta_token = soup.find('meta', {'name': 'csrf-token'})
+                  if meta_token:
+                      token = meta_token.get('content')
+                  if not token:
+                      input_token = soup.find('input', {'name': '_token'})
+                      if input_token:
+                          token = input_token.get('value')
+                  
+                  if not token:
+                      # 尝试从 js 变量里提取
+                      match = re.search(r'token:\s*"([^"]+)"', resp.text)
+                      if match:
+                          token = match.group(1)
+                  
+                  if not token:
+                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100, 'error': 'no token'}
+                  
+                  # 2. 发起测速请求
+                  data = {
+                      'host': ip,
+                      'node': '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20',
+                      '_token': token
+                  }
+                  
+                  resp = s.post(f'https://ping.chinaz.com/{ip}', data=data, timeout=30)
+                  result = resp.json()
+                  
+                  if result.get('code') != 200:
+                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100, 'error': 'api failed'}
+                  
+                  # 3. 等待结果
+                  task_id = result.get('data', {}).get('task_id')
+                  time.sleep(8)
+                  
+                  # 4. 获取结果
+                  resp = s.get(f'https://ping.chinaz.com/task/result/{task_id}', timeout=30)
+                  data = resp.json()
+                  
+                  nodes = data.get('data', {}).get('nodes', [])
+                  pings = []
+                  losses = []
+                  
+                  for node in nodes:
+                      ping = node.get('ping')
+                      loss = node.get('loss')
+                      if ping and ping != '超时' and ping != '-':
+                          try:
+                              pings.append(float(ping))
+                          except:
+                              pass
+                      if loss and loss != '-':
+                          try:
+                              losses.append(float(loss.rstrip('%')))
+                          except:
+                              pass
+                  
+                  avg_ping = round(sum(pings) / len(pings), 1) if pings else 999
+                  avg_loss = round(sum(losses) / len(losses), 1) if losses else 100
+                  
+                  return {'ip': ip, 'avg_ping': avg_ping, 'avg_loss': avg_loss}
+                  
+              except Exception as e:
+                  return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100, 'error': str(e)}
+
+          with open(sys.argv[1]) as f:
+              ips = [l.strip() for l in f if l.strip()]
+          
+          results = []
+          for i, ip in enumerate(ips):
+              print(f"[{i+1}/{len(ips)}] 正在测 {ip} ...", file=sys.stderr)
+              result = pingcn_test(ip)
+              results.append(result)
+              if i < len(ips) - 1:
+                  time.sleep(5)
+          
+          print(json.dumps(results, indent=2, ensure_ascii=False))
+          EOF
+          python3 pingcn_batch.py final_15.txt > pingcn_results.json
+          echo "=== Ping.cn 测速结果 ==="
+          cat pingcn_results.json
+
+      - name: Step 5 - 选出最优 IP
+        run: |
+          echo "=== 第5步：综合评分 ==="
+          cat > pick_best.py << 'EOF'
+          import json, sys
+          
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+          
+          valid = [d for d in data if d.get('avg_ping', 999) < 999 and d.get('avg_loss', 100) < 100]
+          
+          if not valid:
+              print("❌ Ping.cn 测速全部失败")
+              sys.exit(1)
+          
+          def score(r):
+              return r['avg_ping'] * 0.7 + r['avg_loss'] * 3
+          
+          best = min(valid, key=score)
+          
+          print(f"🏆 最优 IP: {best['ip']}")
+          print(f"📊 平均延迟: {best['avg_ping']} ms")
+          print(f"📉 平均丢包: {best['avg_loss']} %")
+          
+          with open('best_ip.txt', 'w') as f:
+              f.write(f"{best['ip']}\n")
+          EOF
+          python3 pick_best.py pingcn_results.json | tee best_ip.txt
+
+      - name: Step 6 - 备选方案（Ping.cn 失败时）
+        if: failure()
+        run: |
+          echo "=== 备选：Ping.cn 失败，改用境外下载测速 ==="
+          ./CloudflareST -f final_15.txt -n 5 -t 4 -tl 400 -sl 5 -dn 10 -url https://speed.cloudflare.com/__down?bytes=104857600
           BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
-          BEST_SPEED=$(awk -F ',' 'NR==2 {print $6}' result.csv)
-          echo "🏆 最优 IP: $BEST_IP"
-          echo "📊 下载速度: $BEST_SPEED MB/s"
+          echo "🏆 最优 IP (境外下载): $BEST_IP"
           echo $BEST_IP > best_ip.txt
 
       - name: Upload Results
@@ -63,4 +207,5 @@ jobs:
           name: cf-results
           path: |
             best_ip.txt
+            pingcn_results.json
             result.csv
