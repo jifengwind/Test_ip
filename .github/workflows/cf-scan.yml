@@ -1,0 +1,137 @@
+name: CF IP Full Auto Select
+
+on:
+  workflow_dispatch:  # 手动触发
+  schedule:
+    - cron: '0 18 * * *'  # 北京时间每天凌晨2点自动跑
+
+jobs:
+  full-auto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Dependencies
+        run: pip install requests
+
+      - name: Download CloudflareST
+        run: |
+          echo "下载 CloudflareSpeedTest ..."
+          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+          tar -xzf CloudflareST_linux_amd64.tar.gz
+          chmod +x CloudflareST
+          echo "下载完成"
+
+      - name: Filter CIDR (仅保留CF常见段)
+        run: |
+          echo "=== 预处理：过滤 Cloudflare 常见 IP 段 ==="
+          grep -E "^(1\.|5\.|8\.|23\.|31\.|45\.|64\.|66\.|72\.|77\.|89\.|104\.|141\.|147\.|162\.|172\.|173\.|185\.|188\.|190\.|191\.|192\.|193\.|194\.|195\.|197\.|198\.|199\.|212\.)" ipv4cidr.txt > cf_cidr.txt 2>/dev/null || cp ipv4cidr.txt cf_cidr.txt
+          echo "原始 CIDR 数量: $(wc -l < ipv4cidr.txt)"
+          echo "过滤后 CIDR 数量: $(wc -l < cf_cidr.txt)"
+
+      - name: Step 1 - Port Scan (境外粗筛)
+        run: |
+          echo "=== 第1步：端口连通性扫描（CIDR自动展开） ==="
+          ./CloudflareST -f cf_cidr.txt -n 300 -t 8 -tl 500 -sl 5 -dn 0 -url https://speed.cloudflare.com/__down?bytes=1048576
+          awk -F ',' 'NR>1 {print $1}' result.csv > step1_300.txt
+          echo "保留 $(wc -l < step1_300.txt) 个 IP"
+
+      - name: Step 2 - Reverse Filter (剔除美西直连)
+        run: |
+          echo "=== 第2步：反向排除美国超低延迟 IP ==="
+          awk -F ',' 'NR>1 && $2 >= 1.5 {print $1}' result.csv > step2_filtered.txt
+          if [ $(wc -l < step2_filtered.txt) -lt 10 ]; then
+            echo "⚠️ 剔除后 IP 太少，改用 step1 结果"
+            cp step1_300.txt step2_filtered.txt
+          fi
+          echo "剩余 $(wc -l < step2_filtered.txt) 个 IP"
+
+      - name: Step 3 - Final Reduce (取前30个)
+        run: |
+          echo "=== 第3步：境外延迟排序，取前30个 ==="
+          ./CloudflareST -f step2_filtered.txt -n 30 -t 8 -tl 400 -sl 5 -dn 0
+          awk -F ',' 'NR>1 {print $1}' result.csv > final_30.txt
+          echo "最终保留 $(wc -l < final_30.txt) 个 IP"
+
+      - name: Step 4 - ITDOG 国内测速
+        run: |
+          echo "=== 第4步：ITDOG 国内节点测速 ==="
+          cat > itdog_batch.py << 'EOF'
+          import requests, time, json, sys
+
+          def itdog_ping(ip):
+              s = requests.Session()
+              s.headers.update({
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'Origin': 'https://www.itdog.cn',
+                  'Referer': 'https://www.itdog.cn/ping/'
+              })
+              try:
+                  resp = s.post('https://www.itdog.cn/api/ping', 
+                                data=f"host={ip}&node=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20", 
+                                timeout=30)
+                  task_id = resp.json().get('data', {}).get('task_id')
+                  if not task_id:
+                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
+                  time.sleep(10)
+                  resp = s.get(f'https://www.itdog.cn/api/ping?task_id={task_id}', timeout=30)
+                  nodes = resp.json().get('data', {}).get('nodes', [])
+                  pings = [n.get('ping_ms') for n in nodes if n.get('ping_ms')]
+                  losses = [float(str(n.get('loss', '0%')).rstrip('%')) for n in nodes]
+                  return {
+                      'ip': ip,
+                      'avg_ping': round(sum(pings)/len(pings), 1) if pings else 999,
+                      'avg_loss': round(sum(losses)/len(losses), 1) if losses else 100
+                  }
+              except:
+                  return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
+
+          with open(sys.argv[1]) as f:
+              ips = [l.strip() for l in f if l.strip()]
+          results = []
+          for i, ip in enumerate(ips):
+              print(f"[{i+1}/{len(ips)}] {ip}", file=sys.stderr)
+              results.append(itdog_ping(ip))
+              if i < len(ips) - 1:
+                  time.sleep(4)
+          print(json.dumps(results, indent=2, ensure_ascii=False))
+          EOF
+          python3 itdog_batch.py final_30.txt > itdog_results.json
+          cat itdog_results.json
+
+      - name: Step 5 - 选出最优 IP
+        run: |
+          echo "=== 第5步：综合评分 ==="
+          cat > pick_best.py << 'EOF'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+          valid = [d for d in data if d['avg_ping'] < 999 and d['avg_loss'] < 100]
+          if not valid:
+              print("无有效IP")
+              sys.exit(1)
+          best = min(valid, key=lambda x: x['avg_ping'] * 0.7 + x['avg_loss'] * 3)
+          print(f"🏆 最优 IP: {best['ip']}")
+          print(f"📊 平均延迟: {best['avg_ping']} ms")
+          print(f"📉 平均丢包: {best['avg_loss']} %")
+          EOF
+          python3 pick_best.py itdog_results.json | tee best_ip.txt
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-ip-results
+          path: |
+            final_30.txt
+            itdog_results.json
+            best_ip.txt
+            result.csv
