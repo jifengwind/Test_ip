@@ -1,14 +1,14 @@
-name: CF IP Auto Select (mcis)
+name: CF IP Auto Select (Stable)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'  # 北京时间每天凌晨2点
+    - cron: '0 18 * * *'
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout Code
@@ -22,25 +22,13 @@ jobs:
       - name: Create Test_ip Directory
         run: mkdir -p Test_ip
 
-      - name: Download mcis
+      - name: Download CloudflareST
         run: |
-          echo "=== 下载 Monte Carlo IP Searcher ==="
-          wget -q https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v0.2.4/mcis-v0.2.4-linux-amd64.tar.gz
-          
-          if [ ! -f mcis-v0.2.4-linux-amd64.tar.gz ]; then
-            echo "❌ 下载失败"
-            exit 1
-          fi
-          
-          tar -xzf mcis-v0.2.4-linux-amd64.tar.gz
-          
-          if [ -f mcis ]; then
-            chmod +x mcis
-            echo "✅ 可执行文件: mcis"
-          else
-            echo "❌ 未找到可执行文件 mcis"
-            exit 1
-          fi
+          echo "=== 下载 CloudflareSpeedTest ==="
+          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+          tar -xzf CloudflareST_linux_amd64.tar.gz
+          chmod +x CloudflareST
+          echo "✅ 下载完成"
 
       - name: Prepare CIDR File
         run: |
@@ -56,170 +44,98 @@ jobs:
             cp official_cidr.txt all_cidr_raw.txt
           fi
           
-          echo "合并后原始 CIDR 数量: $(wc -l < all_cidr_raw.txt)"
+          echo "合并后原始 CIDR: $(wc -l < all_cidr_raw.txt)"
+          
+          # 随机采样 2000 个，加速扫描
+          shuf -n 2000 all_cidr_raw.txt > all_cidr.txt
+          echo "随机采样后 CIDR: $(wc -l < all_cidr.txt)"
 
-      - name: Validate and Clean CIDR
+      - name: Run CloudflareST - Delay Test
         run: |
-          echo "=== 验证并清理 CIDR 格式 ==="
+          echo "=== 延迟测速（取前 30 个） ==="
           
-          cat > validate_cidr.py << 'EOF'
-          import sys
-          import ipaddress
+          # 只测延迟，不测下载
+          ./CloudflareST \
+            -f all_cidr.txt \
+            -n 30 \
+            -t 8 \
+            -tl 500 \
+            -sl 5 \
+            -dn 0
           
-          valid_count = 0
-          invalid_count = 0
-          
-          with open('all_cidr_raw.txt', 'r') as f_in, open('all_cidr.txt', 'w') as f_out:
-              for line in f_in:
-                  line = line.strip()
-                  if not line or line.startswith('#'):
-                      continue
-                  
-                  try:
-                      ipaddress.ip_network(line, strict=False)
-                      f_out.write(line + '\n')
-                      valid_count += 1
-                  except ValueError:
-                      print(f"⚠️ 无效 CIDR: {line}", file=sys.stderr)
-                      invalid_count += 1
-          
-          print(f"✅ 有效 CIDR: {valid_count}")
-          print(f"❌ 无效 CIDR: {invalid_count}")
-          EOF
-          
-          python3 validate_cidr.py
-          echo "清理后 CIDR 数量: $(wc -l < all_cidr.txt)"
-          
-          if [ ! -s all_cidr.txt ]; then
-            echo "❌ 没有有效的 CIDR"
-            exit 1
-          fi
-
-      - name: Run mcis - Smart Search
-        run: |
-          echo "=== mcis 智能搜索（预算: 5000 次探测） ==="
-          
-          ./mcis \
-            -cidr-file all_cidr.txt \
-            -budget 5000 \
-            -top 30 \
-            -concurrency 80 \
-            -timeout 2s \
-            -host speed.cloudflare.com \
-            -download-top 30 \
-            -download-bytes 10485760 \
-            -download-timeout 15s \
-            -download-url http://cachefly.cachefly.net/100mb.test \
-            -out jsonl \
-            -out-file mcis_result.jsonl \
-            -v
-          
-          echo ""
-          
-          if [ ! -f mcis_result.jsonl ]; then
+          if [ ! -f result.csv ]; then
             echo "❌ 未生成结果文件"
             exit 1
           fi
           
-          RESULT_COUNT=$(wc -l < mcis_result.jsonl)
-          echo "=== mcis 搜索完成，返回 $RESULT_COUNT 个 IP ==="
-          
-          if [ "$RESULT_COUNT" -eq 0 ]; then
-            echo "⚠️ 没有搜索到符合条件的 IP"
-          fi
+          echo ""
+          echo "=== 测速完成 ==="
+          head -11 result.csv | column -t -s ','
 
       - name: Process Results - Generate Top 20
         run: |
           echo "=== 处理结果，生成前 20 个 IP ==="
           
           cat > process_result.py << 'EOF'
-          import json
           import csv
           import os
           
-          COLO_MAP = {
-              "HKG": "香港", "TPE": "台北", "NRT": "东京", "KIX": "大阪",
-              "ITM": "大阪伊丹", "FUK": "福冈", "ICN": "首尔", "SIN": "新加坡",
-              "BKK": "曼谷", "HAN": "河内", "SGN": "胡志明市", "MNL": "马尼拉",
-              "CGK": "雅加达", "KUL": "吉隆坡", "RGN": "仰光", "PNH": "金边",
-              "BOM": "孟买", "DEL": "新德里", "MAA": "金奈", "BLR": "班加罗尔",
-              "HYD": "海得拉巴", "CCU": "加尔各答", "SYD": "悉尼", "MEL": "墨尔本",
-              "BNE": "布里斯班", "PER": "珀斯", "AKL": "奥克兰",
-              "LAX": "洛杉矶", "SJC": "圣何塞", "SEA": "西雅图", "SFO": "旧金山",
-              "DFW": "达拉斯", "ORD": "芝加哥", "IAD": "华盛顿", "JFK": "纽约",
-              "LHR": "伦敦", "FRA": "法兰克福", "AMS": "阿姆斯特丹", "CDG": "巴黎",
-              "MAD": "马德里", "MXP": "米兰", "DXB": "迪拜", "GRU": "圣保罗"
-          }
-          
           DEFAULT_PORT = "443"
           
-          if not os.path.exists('mcis_result.jsonl'):
-              print("❌ 未找到 mcis_result.jsonl")
+          if not os.path.exists('result.csv'):
+              print("❌ 未找到 result.csv")
               exit(1)
           
-          # 读取所有结果
-          all_results = []
-          with open('mcis_result.jsonl', 'r') as f:
-              for line in f:
-                  if line.strip():
-                      try:
-                          all_results.append(json.loads(line))
-                      except:
-                          continue
+          results = []
+          with open('result.csv', 'r', encoding='utf-8') as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  ip = row.get('IP 地址', '').strip()
+                  if not ip:
+                      continue
+                  
+                  try:
+                      latency = float(row.get('平均延迟', '0').strip() or '0')
+                  except:
+                      latency = 0
+                  
+                  try:
+                      loss = float(row.get('丢包率', '0').strip().rstrip('%') or '0')
+                  except:
+                      loss = 0
+                  
+                  results.append({
+                      'ip': ip,
+                      'latency': latency,
+                      'loss': loss,
+                      'port': row.get('端口', '443').strip() or '443'
+                  })
           
-          print(f"读取到 {len(all_results)} 个 IP")
+          print(f"读取到 {len(results)} 个 IP")
           
-          if len(all_results) == 0:
+          if len(results) == 0:
               print("❌ 没有搜索到符合条件的 IP")
               with open('Test_ip/best_20.txt', 'w') as f:
                   f.write("# No IPs found\n")
               with open('Test_ip/result_IP.txt', 'w') as f:
                   f.write("# No IPs found\n")
               with open('Test_ip/result.csv', 'w') as f:
-                  f.write("IP 地址,端口,延迟(ms),下载(MB/s),下载(Mbps),线路,地区码\n")
+                  f.write("IP 地址,端口,延迟(ms),丢包率(%)\n")
               exit(0)
           
-          # 分类：下载成功 vs 下载失败
-          download_ok = []
-          download_fail = []
-          
-          for r in all_results:
-              if r.get('download_ok'):
-                  download_ok.append(r)
-              else:
-                  download_fail.append(r)
-          
-          # 成功的按下载速度降序
-          download_ok.sort(key=lambda x: x.get('download_mbps', 0), reverse=True)
-          
-          # 失败的按延迟升序
-          download_fail.sort(key=lambda x: x.get('latency_ms', 999) if x.get('latency_ms') else 999)
-          
-          # 合并：先成功的，后失败的
-          results = download_ok + download_fail
-          
-          print(f"下载成功: {len(download_ok)} 个")
-          print(f"下载失败: {len(download_fail)} 个")
+          # 按延迟升序排序
+          results.sort(key=lambda x: x['latency'])
           
           # 取前 20 个
           top20 = results[:20]
           
           print("")
           print("=== 最终前 20 个 IP ===")
-          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'下载(MB/s)':<12} {'线路':<14} {'状态':<6}")
-          print("-" * 78)
+          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'丢包率(%)':<10}")
+          print("-" * 50)
           
           for i, r in enumerate(top20, 1):
-              ip = r.get('ip', '')
-              latency = r.get('latency_ms', 0) or 0
-              download_mbps = r.get('download_mbps', 0) or 0
-              download_mbs = download_mbps / 8 if download_mbps > 0 else 0
-              colo = r.get('colo', '') or ''
-              line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-              status = "✅" if r.get('download_ok') else "⚠️"
-              
-              speed_str = f"{download_mbs:.1f}" if download_mbs > 0 else "-"
-              print(f"{i:<4} {ip:<18} {latency:<10} {speed_str:<12} {line:<14} {status:<6}")
+              print(f"{i:<4} {r['ip']:<18} {r['latency']:<10.1f} {r['loss']:<10.1f}")
           
           # 保存 best_20.txt
           with open('Test_ip/best_20.txt', 'w') as f:
@@ -229,30 +145,14 @@ jobs:
           # 保存 result_IP.txt
           with open('Test_ip/result_IP.txt', 'w') as f:
               for r in top20:
-                  ip = r['ip']
-                  latency = r.get('latency_ms', 0) or 0
-                  download_mbps = r.get('download_mbps', 0) or 0
-                  colo = r.get('colo', '') or ''
-                  line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-                  
-                  if download_mbps > 0:
-                      f.write(f"{ip}:{DEFAULT_PORT}#{line}-{latency}ms-{download_mbps/8:.1f}MB\n")
-                  else:
-                      f.write(f"{ip}:{DEFAULT_PORT}#{line}-{latency}ms\n")
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}#Cloudflare优选-{r['latency']:.0f}ms\n")
           
           # 保存 result.csv
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
-              writer.writerow(['IP 地址', '端口', '延迟(ms)', '下载(MB/s)', '下载(Mbps)', '线路', '地区码', '下载成功'])
+              writer.writerow(['IP 地址', '端口', '延迟(ms)', '丢包率(%)'])
               for r in top20:
-                  ip = r['ip']
-                  latency = r.get('latency_ms', 0) or 0
-                  download_mbps = r.get('download_mbps', 0) or 0
-                  download_mbs = download_mbps / 8 if download_mbps > 0 else 0
-                  colo = r.get('colo', '') or ''
-                  line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-                  ok = "是" if r.get('download_ok') else "否"
-                  writer.writerow([ip, DEFAULT_PORT, latency, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo, ok])
+                  writer.writerow([r['ip'], DEFAULT_PORT, f"{r['latency']:.1f}", f"{r['loss']:.1f}"])
           
           print("")
           print(f"✅ 已保存前 20 个 IP 到 Test_ip 目录")
