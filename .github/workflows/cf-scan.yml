@@ -120,4 +120,147 @@ jobs:
             exit 1
           fi
 
-      # ... 后续步骤保持不变 ...
+      - name: Process Results - Generate Top 20
+        run: |
+          echo "=== 处理结果，生成前 20 个 IP ==="
+          
+          cat > process_result.py << 'EOF'
+          import json
+          import csv
+          import os
+          
+          COLO_MAP = {
+              "HKG": "香港", "TPE": "台北", "NRT": "东京", "KIX": "大阪",
+              "ITM": "大阪伊丹", "FUK": "福冈", "ICN": "首尔", "SIN": "新加坡",
+              "BKK": "曼谷", "HAN": "河内", "SGN": "胡志明市", "MNL": "马尼拉",
+              "CGK": "雅加达", "KUL": "吉隆坡", "RGN": "仰光", "PNH": "金边",
+              "BOM": "孟买", "DEL": "新德里", "MAA": "金奈", "BLR": "班加罗尔",
+              "HYD": "海得拉巴", "CCU": "加尔各答", "SYD": "悉尼", "MEL": "墨尔本",
+              "BNE": "布里斯班", "PER": "珀斯", "AKL": "奥克兰"
+          }
+          
+          DEFAULT_PORT = "443"
+          
+          results = []
+          if not os.path.exists('mcis_result.jsonl'):
+              print("❌ 未找到 mcis_result.jsonl")
+              exit(1)
+          
+          with open('mcis_result.jsonl', 'r') as f:
+              for line in f:
+                  if line.strip():
+                      results.append(json.loads(line))
+          
+          print(f"读取到 {len(results)} 个 IP")
+          print("")
+          
+          if len(results) == 0:
+              print("❌ 没有搜索到符合条件的 IP")
+              with open('Test_ip/best_20.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              with open('Test_ip/result_IP.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              exit(0)
+          
+          def sort_key(r):
+              if r.get('download_mbps', 0) > 0:
+                  return (-r['download_mbps'], r.get('latency_ms', 999))
+              else:
+                  return (-999, r.get('latency_ms', 999))
+          
+          results.sort(key=sort_key)
+          top20 = results[:20]
+          
+          print("=== 最终前 20 个 IP ===")
+          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'下载(MB/s)':<12} {'线路':<12}")
+          print("-" * 65)
+          
+          for i, r in enumerate(top20, 1):
+              ip = r.get('ip', '')
+              latency = r.get('latency_ms', 0)
+              download_mbps = r.get('download_mbps', 0)
+              download_mbs = download_mbps / 8 if download_mbps > 0 else 0
+              colo = r.get('colo', '')
+              line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
+              
+              speed_str = f"{download_mbs:.1f}" if download_mbs > 0 else "-"
+              print(f"{i:<4} {ip:<18} {latency:<10} {speed_str:<12} {line:<12}")
+          
+          with open('Test_ip/best_20.txt', 'w') as f:
+              for r in top20:
+                  f.write(f"{r['ip']}\n")
+          
+          with open('Test_ip/result_IP.txt', 'w') as f:
+              for r in top20:
+                  ip = r['ip']
+                  latency = r.get('latency_ms', 0)
+                  colo = r.get('colo', '')
+                  line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
+                  f.write(f"{ip}:{DEFAULT_PORT}#{line}-{latency}ms\n")
+          
+          with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
+              writer = csv.writer(f)
+              writer.writerow(['IP 地址', '端口', '平均延迟(ms)', '下载速度(MB/s)', '下载速度(Mbps)', '线路', '地区码'])
+              for r in top20:
+                  ip = r['ip']
+                  latency = r.get('latency_ms', 0)
+                  download_mbps = r.get('download_mbps', 0)
+                  download_mbs = download_mbps / 8 if download_mbps > 0 else 0
+                  colo = r.get('colo', '')
+                  line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
+                  writer.writerow([ip, DEFAULT_PORT, latency, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo])
+          
+          if top20:
+              with open('Test_ip/best_ip.txt', 'w') as f:
+                  f.write(f"{top20[0]['ip']}\n")
+          
+          print("")
+          print(f"✅ 已保存前 20 个 IP 到 Test_ip 目录")
+          EOF
+          
+          python3 process_result.py
+
+      - name: Show Results
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📁 Test_ip 目录内容"
+          echo "=========================================="
+          ls -la Test_ip/ || echo "目录为空"
+          echo ""
+          
+          if [ -f Test_ip/result_IP.txt ]; then
+            echo "=========================================="
+            echo "📄 result_IP.txt 内容预览"
+            echo "=========================================="
+            head -10 Test_ip/result_IP.txt
+          fi
+          
+          if [ -f Test_ip/best_20.txt ]; then
+            echo ""
+            echo "=========================================="
+            echo "📄 best_20.txt 内容预览"
+            echo "=========================================="
+            head -10 Test_ip/best_20.txt
+          fi
+
+      - name: Commit and Push Results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add Test_ip/
+          
+          if git diff --cached --quiet; then
+            echo "没有变更，跳过提交"
+          else
+            git commit -m "Update CF preferred IPs (mcis) - $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+            echo "✅ 已推送到仓库"
+          fi
+
+      - name: Upload Artifacts (备用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-ip-results
+          path: Test_ip/
