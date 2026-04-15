@@ -61,70 +61,127 @@ jobs:
           awk -F ',' 'NR>1 {print $1}' result.csv > final_30.txt
           echo "最终保留 $(wc -l < final_30.txt) 个 IP"
 
-      - name: Step 4 - ITDOG 国内测速
+      - name: Step 4 - Boce 国内测速
         run: |
-          echo "=== 第4步：ITDOG 国内节点测速 ==="
-          cat > itdog_batch.py << 'EOF'
-          import requests, time, json, sys
+          echo "=== 第4步：Boce 国内节点测速 ==="
+          cat > boce_batch.py << 'EOF'
+          import requests
+          import time
+          import json
+          import sys
 
-          def itdog_ping(ip):
+          def boce_ping(ip):
               s = requests.Session()
               s.headers.update({
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                  'Origin': 'https://www.itdog.cn',
-                  'Referer': 'https://www.itdog.cn/ping/'
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Referer': 'https://www.boce.com/',
+                  'Origin': 'https://www.boce.com',
+                  'Content-Type': 'application/x-www-form-urlencoded'
               })
               try:
-                  resp = s.post('https://www.itdog.cn/api/ping', 
-                                data=f"host={ip}&node=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20", 
+                  # 创建测速任务
+                  resp = s.post('https://api.boce.com/v3/task/create/ping', 
+                                data={'host': ip, 'node': 'all'}, 
                                 timeout=30)
                   task_id = resp.json().get('data', {}).get('task_id')
+                  
                   if not task_id:
-                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
-                  time.sleep(10)
-                  resp = s.get(f'https://www.itdog.cn/api/ping?task_id={task_id}', timeout=30)
-                  nodes = resp.json().get('data', {}).get('nodes', [])
-                  pings = [n.get('ping_ms') for n in nodes if n.get('ping_ms')]
-                  losses = [float(str(n.get('loss', '0%')).rstrip('%')) for n in nodes]
-                  return {
-                      'ip': ip,
-                      'avg_ping': round(sum(pings)/len(pings), 1) if pings else 999,
-                      'avg_loss': round(sum(losses)/len(losses), 1) if losses else 100
-                  }
-              except:
-                  return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
+                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100, 'error': 'no task_id'}
+                  
+                  # 等待结果
+                  time.sleep(8)
+                  
+                  # 获取结果
+                  result_url = f'https://api.boce.com/v3/task/result/{task_id}'
+                  resp = s.get(result_url, timeout=30)
+                  data = resp.json().get('data', {})
+                  
+                  pings = []
+                  losses = []
+                  for node_id, node in data.items():
+                      if isinstance(node, dict):
+                          ping = node.get('ping')
+                          loss = node.get('loss')
+                          if ping is not None and ping != '':
+                              try:
+                                  pings.append(float(ping))
+                              except:
+                                  pass
+                          if loss is not None and loss != '':
+                              try:
+                                  losses.append(float(loss))
+                              except:
+                                  pass
+                  
+                  avg_ping = round(sum(pings) / len(pings), 1) if pings else 999
+                  avg_loss = round(sum(losses) / len(losses), 1) if losses else 100
+                  
+                  return {'ip': ip, 'avg_ping': avg_ping, 'avg_loss': avg_loss}
+                  
+              except Exception as e:
+                  return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100, 'error': str(e)}
 
           with open(sys.argv[1]) as f:
               ips = [l.strip() for l in f if l.strip()]
+          
           results = []
           for i, ip in enumerate(ips):
-              print(f"[{i+1}/{len(ips)}] {ip}", file=sys.stderr)
-              results.append(itdog_ping(ip))
+              print(f"[{i+1}/{len(ips)}] 正在测 {ip} ...", file=sys.stderr)
+              result = boce_ping(ip)
+              results.append(result)
+              # 间隔3秒防止被封
               if i < len(ips) - 1:
-                  time.sleep(4)
+                  time.sleep(3)
+          
           print(json.dumps(results, indent=2, ensure_ascii=False))
           EOF
-          python3 itdog_batch.py final_30.txt > itdog_results.json
-          cat itdog_results.json
+          python3 boce_batch.py final_30.txt > boce_results.json
+          echo "=== Boce 测速结果 ==="
+          cat boce_results.json
 
       - name: Step 5 - 选出最优 IP
         run: |
           echo "=== 第5步：综合评分 ==="
           cat > pick_best.py << 'EOF'
-          import json, sys
+          import json
+          import sys
+
           with open(sys.argv[1]) as f:
               data = json.load(f)
-          valid = [d for d in data if d['avg_ping'] < 999 and d['avg_loss'] < 100]
+          
+          # 过滤掉失败的
+          valid = [d for d in data if d.get('avg_ping', 999) < 999 and d.get('avg_loss', 100) < 100]
+          
           if not valid:
-              print("无有效IP")
+              print("❌ 无有效 IP，所有测速均失败")
+              print("💡 建议：可能是 Boce 反爬，尝试切换到备用方案")
               sys.exit(1)
-          best = min(valid, key=lambda x: x['avg_ping'] * 0.7 + x['avg_loss'] * 3)
+          
+          # 综合评分：延迟权重0.7，丢包权重3（每1%丢包=3ms延迟）
+          def score(r):
+              return r['avg_ping'] * 0.7 + r['avg_loss'] * 3
+          
+          best = min(valid, key=score)
+          
           print(f"🏆 最优 IP: {best['ip']}")
           print(f"📊 平均延迟: {best['avg_ping']} ms")
           print(f"📉 平均丢包: {best['avg_loss']} %")
+          print(f"📈 综合评分: {score(best):.1f}")
+          
+          # 输出到文件
+          with open('best_ip.txt', 'w') as f:
+              f.write(f"{best['ip']}\n")
           EOF
-          python3 pick_best.py itdog_results.json | tee best_ip.txt
+          python3 pick_best.py boce_results.json | tee best_ip.txt
+
+      - name: Step 6 - 备选：如果 Boce 失败则用境外结果
+        if: failure()
+        run: |
+          echo "=== 备选方案：Boce 失败，改用境外扫描结果 ==="
+          BEST_IP=$(awk -F ',' 'NR==2 {print $1}' result.csv)
+          echo "🏆 最优 IP (境外视角): $BEST_IP"
+          echo "⚠️ 注意：此结果为境外延迟排序，仅供参考"
+          echo $BEST_IP > best_ip.txt
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -132,6 +189,6 @@ jobs:
           name: cf-ip-results
           path: |
             final_30.txt
-            itdog_results.json
+            boce_results.json
             best_ip.txt
             result.csv
