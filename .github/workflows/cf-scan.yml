@@ -1,26 +1,18 @@
-name: CF IP Auto Select (mcis + Ping.cn)
+name: CF IP Auto Select (mcis)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 * * *'  # 北京时间每天凌晨2点
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Dependencies
-        run: pip install requests beautifulsoup4
 
       - name: Create Test_ip Directory
         run: mkdir -p Test_ip
@@ -28,15 +20,26 @@ jobs:
       - name: Download mcis
         run: |
           echo "=== 下载 Monte Carlo IP Searcher ==="
+          
+          # 下载 v0.2.4 版本
           wget -q https://github.com/Leo-Mu/montecarlo-ip-searcher/releases/download/v0.2.4/mcis-v0.2.4-linux-amd64.tar.gz
           
+          # 检查下载是否成功
           if [ ! -f mcis-v0.2.4-linux-amd64.tar.gz ]; then
             echo "❌ 下载失败"
             exit 1
           fi
           
+          echo "✅ 下载完成，正在解压..."
+          
+          # 解压
           tar -xzf mcis-v0.2.4-linux-amd64.tar.gz
           
+          # 列出解压出的文件
+          echo "解压出的文件："
+          ls -la
+          
+          # 查找可执行文件（通常是 mcis）
           if [ -f mcis ]; then
             chmod +x mcis
             echo "✅ 可执行文件: mcis"
@@ -48,68 +51,38 @@ jobs:
       - name: Prepare CIDR File
         run: |
           echo "=== 准备 CIDR 文件 ==="
+          
+          # 下载官方 IPv4 列表
           wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
           echo "官方 CIDR: $(wc -l < official_cidr.txt)"
           
+          # 合并你的 CIDR（如果存在）
           if [ -f ipv4cidr.txt ]; then
             echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
-            cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr_raw.txt
+            cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr.txt
           else
-            cp official_cidr.txt all_cidr_raw.txt
+            cp official_cidr.txt all_cidr.txt
           fi
           
-          echo "合并后原始 CIDR 数量: $(wc -l < all_cidr_raw.txt)"
-
-      - name: Validate and Clean CIDR
-        run: |
-          echo "=== 验证并清理 CIDR 格式 ==="
-          
-          cat > validate_cidr.py << 'EOF'
-          import sys
-          import ipaddress
-          
-          valid_count = 0
-          invalid_count = 0
-          
-          with open('all_cidr_raw.txt', 'r') as f_in, open('all_cidr.txt', 'w') as f_out:
-              for line in f_in:
-                  line = line.strip()
-                  if not line or line.startswith('#'):
-                      continue
-                  
-                  try:
-                      ipaddress.ip_network(line, strict=False)
-                      f_out.write(line + '\n')
-                      valid_count += 1
-                  except ValueError:
-                      print(f"⚠️ 无效 CIDR: {line}", file=sys.stderr)
-                      invalid_count += 1
-          
-          print(f"✅ 有效 CIDR: {valid_count}")
-          print(f"❌ 无效 CIDR: {invalid_count}")
-          EOF
-          
-          python3 validate_cidr.py
-          echo "清理后 CIDR 数量: $(wc -l < all_cidr.txt)"
-          
-          if [ ! -s all_cidr.txt ]; then
-            echo "❌ 没有有效的 CIDR"
-            exit 1
-          fi
+          echo "合并后 CIDR 数量: $(wc -l < all_cidr.txt)"
 
       - name: Run mcis - Smart Search
         run: |
-          echo "=== mcis 智能搜索（预算: 3000 次探测） ==="
+          echo "=== mcis 智能搜索（预算: 2000 次探测） ==="
           
-          # 不限制 colo，让 mcis 返回更多结果
+          # 亚太地区机房码
+          COLO_LIST="HKG,TPE,NRT,KIX,ITM,FUK,ICN,SIN,BKK,HAN,SGN,MNL,CGK,KUL,RGN,PNH,BOM,DEL,MAA,BLR,HYD,CCU,SYD,MEL,BNE,PER,AKL"
+          
+          # 运行 mcis
           ./mcis \
             -cidr-file all_cidr.txt \
-            -budget 3000 \
-            -top 50 \
+            -budget 2000 \
+            -top 30 \
             -concurrency 100 \
             -timeout 3s \
             -host speed.cloudflare.com \
-            -download-top 20 \
+            -colo "$COLO_LIST" \
+            -download-top 10 \
             -download-bytes 10485760 \
             -download-timeout 15s \
             -out jsonl \
@@ -117,166 +90,19 @@ jobs:
             -v
           
           echo ""
-          echo "=== mcis 搜索完成，返回 $(wc -l < mcis_result.jsonl) 个 IP ==="
+          echo "=== mcis 搜索完成 ==="
           
+          # 检查结果文件
           if [ ! -f mcis_result.jsonl ]; then
             echo "❌ 未生成结果文件"
             exit 1
           fi
 
-      - name: Extract Candidates for Ping.cn
-        run: |
-          echo "=== 提取候选 IP 供 Ping.cn 测速 ==="
-          
-          cat > extract_candidates.py << 'EOF'
-          import json
-          
-          # 亚太地区机房码（用于筛选）
-          COLO_ALLOW = {
-              "HKG", "TPE", "NRT", "KIX", "ITM", "FUK", "ICN", "SIN",
-              "BKK", "HAN", "SGN", "MNL", "CGK", "KUL", "RGN", "PNH",
-              "BOM", "DEL", "MAA", "BLR", "HYD", "CCU", "SYD", "MEL",
-              "BNE", "PER", "AKL"
-          }
-          
-          results = []
-          with open('mcis_result.jsonl', 'r') as f:
-              for line in f:
-                  if line.strip():
-                      r = json.loads(line)
-                      colo = r.get('colo', '')
-                      # 优先保留亚太机房，但如果没有也保留
-                      if colo in COLO_ALLOW or not colo:
-                          results.append(r)
-          
-          print(f"筛选后剩余 {len(results)} 个 IP")
-          
-          # 按延迟排序，取前 30 个给 Ping.cn 测速
-          results.sort(key=lambda x: x.get('latency_ms', 999))
-          candidates = results[:30]
-          
-          # 保存候选 IP 列表
-          with open('candidates.txt', 'w') as f:
-              for r in candidates:
-                  f.write(f"{r['ip']}\n")
-          
-          print(f"提取 {len(candidates)} 个候选 IP 供 Ping.cn 测速")
-          EOF
-          
-          python3 extract_candidates.py
-          
-          echo ""
-          echo "=== 候选 IP 预览 ==="
-          head -10 candidates.txt
-
-      - name: Ping.cn 国内测速
-        run: |
-          echo "=== Ping.cn 国内节点测速 ==="
-          
-          cat > pingcn_test.py << 'EOF'
-          import requests
-          import time
-          import json
-          import sys
-          import re
-          from bs4 import BeautifulSoup
-
-          def pingcn_test(ip):
-              s = requests.Session()
-              s.headers.update({
-                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                  'Referer': 'https://ping.chinaz.com/',
-                  'Origin': 'https://ping.chinaz.com'
-              })
-              
-              try:
-                  resp = s.get(f'https://ping.chinaz.com/{ip}', timeout=15)
-                  soup = BeautifulSoup(resp.text, 'html.parser')
-                  
-                  token = None
-                  meta_token = soup.find('meta', {'name': 'csrf-token'})
-                  if meta_token:
-                      token = meta_token.get('content')
-                  if not token:
-                      input_token = soup.find('input', {'name': '_token'})
-                      if input_token:
-                          token = input_token.get('value')
-                  if not token:
-                      match = re.search(r'token:\s*"([^"]+)"', resp.text)
-                      if match:
-                          token = match.group(1)
-                  
-                  if not token:
-                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
-                  
-                  data = {
-                      'host': ip,
-                      'node': '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20',
-                      '_token': token
-                  }
-                  
-                  resp = s.post(f'https://ping.chinaz.com/{ip}', data=data, timeout=30)
-                  result = resp.json()
-                  
-                  if result.get('code') != 200:
-                      return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
-                  
-                  task_id = result.get('data', {}).get('task_id')
-                  time.sleep(10)
-                  
-                  resp = s.get(f'https://ping.chinaz.com/task/result/{task_id}', timeout=30)
-                  data = resp.json()
-                  
-                  nodes = data.get('data', {}).get('nodes', [])
-                  pings = []
-                  losses = []
-                  
-                  for node in nodes:
-                      ping = node.get('ping')
-                      loss = node.get('loss')
-                      if ping and ping != '超时' and ping != '-':
-                          try:
-                              pings.append(float(ping))
-                          except:
-                              pass
-                      if loss and loss != '-':
-                          try:
-                              losses.append(float(loss.rstrip('%')))
-                          except:
-                              pass
-                  
-                  avg_ping = round(sum(pings) / len(pings), 1) if pings else 999
-                  avg_loss = round(sum(losses) / len(losses), 1) if losses else 100
-                  
-                  return {'ip': ip, 'avg_ping': avg_ping, 'avg_loss': avg_loss}
-                  
-              except Exception as e:
-                  return {'ip': ip, 'avg_ping': 999, 'avg_loss': 100}
-
-          with open(sys.argv[1]) as f:
-              ips = [l.strip() for l in f if l.strip()]
-          
-          results = []
-          for i, ip in enumerate(ips):
-              print(f"[{i+1}/{len(ips)}] 正在测 {ip} ...", file=sys.stderr)
-              result = pingcn_test(ip)
-              results.append(result)
-              if i < len(ips) - 1:
-                  time.sleep(5)
-          
-          print(json.dumps(results, indent=2, ensure_ascii=False))
-          EOF
-          
-          python3 pingcn_test.py candidates.txt > pingcn_results.json
-          
-          echo ""
-          echo "=== Ping.cn 测速完成 ==="
-
       - name: Process Results - Generate Top 20
         run: |
-          echo "=== 综合评分，生成前 20 个 IP ==="
+          echo "=== 处理结果，生成前 20 个 IP ==="
           
-          cat > process_final.py << 'EOF'
+          cat > process_result.py << 'EOF'
           import json
           import csv
           import os
@@ -293,73 +119,53 @@ jobs:
           
           DEFAULT_PORT = "443"
           
-          # 读取 mcis 结果（用于获取 colo 和下载速度）
-          mcis_data = {}
-          if os.path.exists('mcis_result.jsonl'):
-              with open('mcis_result.jsonl', 'r') as f:
-                  for line in f:
-                      if line.strip():
-                          r = json.loads(line)
-                          mcis_data[r['ip']] = r
+          # 读取 mcis 结果
+          results = []
+          if not os.path.exists('mcis_result.jsonl'):
+              print("❌ 未找到 mcis_result.jsonl")
+              exit(1)
           
-          # 读取 Ping.cn 结果
-          pingcn_results = []
-          if os.path.exists('pingcn_results.json'):
-              with open('pingcn_results.json', 'r') as f:
-                  pingcn_results = json.load(f)
+          with open('mcis_result.jsonl', 'r') as f:
+              for line in f:
+                  if line.strip():
+                      results.append(json.loads(line))
           
-          # 过滤有效结果
-          valid = []
-          for r in pingcn_results:
-              if r.get('avg_ping', 999) < 999 and r.get('avg_loss', 100) < 100:
-                  ip = r['ip']
-                  # 补充 mcis 的数据
-                  mcis_r = mcis_data.get(ip, {})
-                  r['colo'] = mcis_r.get('colo', '')
-                  r['download_mbps'] = mcis_r.get('download_mbps', 0)
-                  r['latency_ms'] = mcis_r.get('latency_ms', r['avg_ping'])
-                  valid.append(r)
-          
-          print(f"Ping.cn 有效结果: {len(valid)} 个")
+          print(f"读取到 {len(results)} 个 IP")
           print("")
           
-          if not valid:
-              print("❌ 没有有效的 Ping.cn 结果，使用 mcis 数据")
-              for ip, r in mcis_data.items():
-                  if r.get('latency_ms', 999) < 999:
-                      valid.append({
-                          'ip': ip,
-                          'avg_ping': r.get('latency_ms', 0),
-                          'avg_loss': 0,
-                          'colo': r.get('colo', ''),
-                          'download_mbps': r.get('download_mbps', 0),
-                          'latency_ms': r.get('latency_ms', 0)
-                      })
+          if len(results) == 0:
+              print("❌ 没有搜索到符合条件的 IP")
+              # 生成空文件避免后续步骤报错
+              with open('Test_ip/best_20.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              with open('Test_ip/result_IP.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              exit(0)
           
-          # 综合评分：Ping.cn 延迟权重 0.7，丢包权重 3
-          def score(r):
-              return r['avg_ping'] * 0.7 + r.get('avg_loss', 0) * 3
+          def sort_key(r):
+              if r.get('download_mbps', 0) > 0:
+                  return (-r['download_mbps'], r.get('latency_ms', 999))
+              else:
+                  return (-999, r.get('latency_ms', 999))
           
-          valid.sort(key=score)
-          top20 = valid[:20]
+          results.sort(key=sort_key)
+          top20 = results[:20]
           
           print("=== 最终前 20 个 IP ===")
-          print(f"{'排名':<4} {'IP地址':<18} {'国内延迟':<10} {'丢包(%)':<8} {'境外下载':<10} {'线路':<12}")
-          print("-" * 70)
+          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'下载(MB/s)':<12} {'线路':<12}")
+          print("-" * 65)
           
           for i, r in enumerate(top20, 1):
-              ip = r['ip']
-              ping = r['avg_ping']
-              loss = r.get('avg_loss', 0)
+              ip = r.get('ip', '')
+              latency = r.get('latency_ms', 0)
               download_mbps = r.get('download_mbps', 0)
               download_mbs = download_mbps / 8 if download_mbps > 0 else 0
               colo = r.get('colo', '')
               line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
               
               speed_str = f"{download_mbs:.1f}" if download_mbs > 0 else "-"
-              print(f"{i:<4} {ip:<18} {ping:<10} {loss:<8} {speed_str:<10} {line:<12}")
+              print(f"{i:<4} {ip:<18} {latency:<10} {speed_str:<12} {line:<12}")
           
-          # 保存文件
           with open('Test_ip/best_20.txt', 'w') as f:
               for r in top20:
                   f.write(f"{r['ip']}\n")
@@ -367,23 +173,22 @@ jobs:
           with open('Test_ip/result_IP.txt', 'w') as f:
               for r in top20:
                   ip = r['ip']
-                  ping = r['avg_ping']
+                  latency = r.get('latency_ms', 0)
                   colo = r.get('colo', '')
                   line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-                  f.write(f"{ip}:{DEFAULT_PORT}#{line}-{ping}ms\n")
+                  f.write(f"{ip}:{DEFAULT_PORT}#{line}-{latency}ms\n")
           
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
-              writer.writerow(['IP 地址', '端口', '国内延迟(ms)', '丢包率(%)', '境外下载(MB/s)', '境外下载(Mbps)', '线路', '地区码'])
+              writer.writerow(['IP 地址', '端口', '平均延迟(ms)', '下载速度(MB/s)', '下载速度(Mbps)', '线路', '地区码'])
               for r in top20:
                   ip = r['ip']
-                  ping = r['avg_ping']
-                  loss = r.get('avg_loss', 0)
+                  latency = r.get('latency_ms', 0)
                   download_mbps = r.get('download_mbps', 0)
                   download_mbs = download_mbps / 8 if download_mbps > 0 else 0
                   colo = r.get('colo', '')
                   line = COLO_MAP.get(colo, colo if colo else 'Cloudflare优选')
-                  writer.writerow([ip, DEFAULT_PORT, ping, loss, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo])
+                  writer.writerow([ip, DEFAULT_PORT, latency, f"{download_mbs:.2f}", f"{download_mbps:.2f}", line, colo])
           
           if top20:
               with open('Test_ip/best_ip.txt', 'w') as f:
@@ -393,7 +198,7 @@ jobs:
           print(f"✅ 已保存前 20 个 IP 到 Test_ip 目录")
           EOF
           
-          python3 process_final.py
+          python3 process_result.py
 
       - name: Show Results
         run: |
@@ -421,7 +226,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有变更，跳过提交"
           else
-            git commit -m "Update CF preferred IPs (mcis + Ping.cn) - $(date +'%Y-%m-%d %H:%M:%S')"
+            git commit -m "Update CF preferred IPs (mcis) - $(date +'%Y-%m-%d %H:%M:%S')"
             git push
             echo "✅ 已推送到仓库"
           fi
