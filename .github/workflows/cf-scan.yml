@@ -245,7 +245,9 @@ jobs:
           
           python3 process_result.py
 
-      - name: Show Results
+          echo "=== 追踪 Cloudflare 边缘节点位置 ==="
+          curl -s https://cloudflare.com/cdn-cgi/trace | grep loc
+          - name: Show Results
         run: |
           echo ""
           echo "=========================================="
