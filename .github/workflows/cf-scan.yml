@@ -13,8 +13,8 @@ on:
 
 env:
   # -------------------- 抽样与扫描配置 --------------------
-  SAMPLE_SIZE: 500000                # 从百万级 IP 池中随机抽取多少个 IP 进行扫描
-  OUTPUT_N: 100000                    # CloudflareST 输出的候选 IP 数量
+  SAMPLE_SIZE: 1000000                # 从百万级 IP 池中随机抽取多少个 IP 进行扫描
+  OUTPUT_N: 200000                    # CloudflareST 输出的候选 IP 数量
   MAX_LATENCY: 400                 # 延迟上限(ms)，超过此值的 IP 直接丢弃
   THREADS: 60                      # 并发线程数，越高扫描越快（建议 16-64）
   
