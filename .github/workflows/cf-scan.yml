@@ -1,9 +1,33 @@
+# =============================================================================
+# CF IP Auto Select - 可配置参数区
+# =============================================================================
+# 修改下面的数值即可控制整个扫描流程，无需翻找代码
+# =============================================================================
+
 name: CF IP Auto Select (Final Stable)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 * * *'           # 每天北京时间 02:00 执行（UTC 18:00）
+
+env:
+  # -------------------- 抽样与扫描配置 --------------------
+  SAMPLE_SIZE: 80000                # 从百万级 IP 池中随机抽取多少个 IP 进行扫描
+  OUTPUT_N: 2000                    # CloudflareST 输出的候选 IP 数量
+  MAX_LATENCY: 400                 # 延迟上限(ms)，超过此值的 IP 直接丢弃
+  THREADS: 60                      # 并发线程数，越高扫描越快（建议 16-64）
+  
+  # -------------------- 结果筛选配置 --------------------
+  FINAL_OUTPUT: 200                 # 最终保存到文件的最优 IP 数量
+  MAX_LOSS: 5                     # 最大丢包率(%)，超过此值的 IP 丢弃
+  
+  # -------------------- 输出端口配置 --------------------
+  DEFAULT_PORT: 443                # 输出 IP 时使用的端口号
+
+# =============================================================================
+# 以下为执行逻辑，通常无需修改
+# =============================================================================
 
 jobs:
   scan:
@@ -30,50 +54,74 @@ jobs:
           chmod +x CloudflareST
           echo "✅ 下载完成"
 
-      - name: Prepare IP List
+      - name: Prepare CIDR and Sample IPs
         run: |
-          echo "=== 准备 IP 列表 ==="
+          echo "=== 准备 CIDR 列表 ==="
           
-          if [ -f iplist_full.txt ]; then
-            echo "✅ 使用本地 iplist_full.txt"
-            cp iplist_full.txt all_ips_raw.txt
+          if [ -f ipv4cidr.txt ]; then
+            echo "✅ 使用本地 ipv4cidr.txt"
+            cp ipv4cidr.txt all_cidr.txt
           else
-            echo "⚠️ 未找到 iplist_full.txt，从官方 CIDR 生成"
-            wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
-            
-            if [ -f ipv4cidr.txt ]; then
-              cat official_cidr.txt ipv4cidr.txt > all_cidr.txt
-            else
-              cp official_cidr.txt all_cidr.txt
-            fi
-            
-            echo "CIDR 数量: $(wc -l < all_cidr.txt)"
-            cp all_cidr.txt all_ips_raw.txt
+            echo "⚠️ 未找到 ipv4cidr.txt，使用官方 CIDR"
+            wget -q https://www.cloudflare.com/ips-v4/ -O all_cidr.txt
           fi
           
-          echo "原始 IP/段 数量: $(wc -l < all_ips_raw.txt)"
-
-      - name: Sample IPs for Speed
-        run: |
-          echo "=== 随机采样加速 ==="
+          echo "CIDR 段数量: $(wc -l < all_cidr.txt)"
+          echo ""
+          echo "=== 从 CIDR 中随机抽取 ${{ env.SAMPLE_SIZE }} 个 IP ==="
           
-          # 【可修改】采样数量，改这里的数字即可
-          SAMPLE_SIZE=5000
+          python3 << EOF
+          import ipaddress
+          import random
+          import os
           
-          shuf -n $SAMPLE_SIZE all_ips_raw.txt > all_ips.txt 2>/dev/null || head -$SAMPLE_SIZE all_ips_raw.txt > all_ips.txt
+          SAMPLE_SIZE = int(os.environ.get('SAMPLE_SIZE', 3000))
           
-          echo "采样数量: $SAMPLE_SIZE"
-          echo "采样后待扫描数量: $(wc -l < all_ips.txt)"
+          cidrs = []
+          with open('all_cidr.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      try:
+                          cidrs.append(ipaddress.ip_network(line, strict=False))
+                      except:
+                          pass
+          
+          print(f"有效 CIDR 段: {len(cidrs)}")
+          
+          total_ips = sum(n.num_addresses - 2 for n in cidrs)
+          print(f"总 IP 数量: {total_ips}")
+          
+          sample_ips = set()
+          max_attempts = SAMPLE_SIZE * 100
+          attempts = 0
+          
+          while len(sample_ips) < SAMPLE_SIZE and attempts < max_attempts:
+              net = random.choice(cidrs)
+              ip_int = random.randint(1, net.num_addresses - 2)
+              sample_ips.add(str(net[ip_int]))
+              attempts += 1
+          
+          with open('all_ips.txt', 'w') as f:
+              for ip in sample_ips:
+                  f.write(ip + '\n')
+          
+          print(f"实际抽样: {len(sample_ips)} 个 IP")
+          EOF
+          
+          echo ""
+          echo "待扫描 IP 数量: $(wc -l < all_ips.txt)"
 
       - name: Run CloudflareST - Delay Test
         run: |
           echo "=== 延迟测速 (HTTPing 模式) ==="
+          echo "配置: 候选数=${{ env.OUTPUT_N }} | 延迟上限=${{ env.MAX_LATENCY }}ms | 线程=${{ env.THREADS }}"
           
           ./CloudflareST \
             -f all_ips.txt \
-            -n 1000 \
-            -t 32 \
-            -tl 500 \
+            -n ${{ env.OUTPUT_N }} \
+            -t ${{ env.THREADS }} \
+            -tl ${{ env.MAX_LATENCY }} \
             -httping \
             -dd
           
@@ -89,16 +137,15 @@ jobs:
       - name: Process Results - Generate Top IPs
         run: |
           echo "=== 处理结果，生成优选 IP ==="
-          
-          # 【可修改】最终输出的 IP 数量
-          OUTPUT_COUNT=200
+          echo "配置: 最终输出=${{ env.FINAL_OUTPUT }} | 最大丢包=${{ env.MAX_LOSS }}%"
           
           cat > process_result.py << EOF
           import csv
           import os
 
-          DEFAULT_PORT = "443"
-          OUTPUT_COUNT = $OUTPUT_COUNT
+          DEFAULT_PORT = "${{ env.DEFAULT_PORT }}"
+          OUTPUT_COUNT = ${{ env.FINAL_OUTPUT }}
+          MAX_LOSS = ${{ env.MAX_LOSS }}
 
           def detect_isp(ip):
               if ip.startswith('104.16') or ip.startswith('104.18') or \
@@ -135,7 +182,7 @@ jobs:
                   except:
                       loss = 0
                   
-                  if loss > 10:
+                  if loss > MAX_LOSS:
                       continue
                   
                   isp = detect_isp(ip)
@@ -184,7 +231,7 @@ jobs:
 
           with open('Test_ip/result_IP.txt', 'w') as f:
               for r in top_results:
-                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}优选\n")
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}\n")
 
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
