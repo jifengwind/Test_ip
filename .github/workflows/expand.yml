@@ -13,27 +13,30 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          
-      - name: List files (调试用)
-        run: ls -la
-          
+        
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           
       - name: Expand CIDR
-        run: |
-          # 安装 ipaddress 库（Python 3 内置，但确认一下）
-          python -m pip install --upgrade pip
-          python expand_cidr.py
-          
+        run: python expand_cidr.py
+        
       - name: Commit and Push
         run: |
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
+          
+          # 先拉取远程最新代码，然后合并
+          git pull --rebase origin main
+          
+          # 添加文件
           git add iplist_full.txt
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto expand CIDR [skip ci]"
-          git push
+          
+          # 检查是否有变更
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto expand CIDR [skip ci]"
+            git push origin main
+          fi
