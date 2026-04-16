@@ -27,16 +27,14 @@ jobs:
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'actions@github.com'
           
-          # 先拉取远程最新代码，然后合并
-          git pull --rebase origin main
+          git fetch origin main
+          git reset --soft origin/main
           
-          # 添加文件
           git add iplist_full.txt
           
-          # 检查是否有变更
           if git diff --quiet && git diff --staged --quiet; then
             echo "No changes to commit"
           else
             git commit -m "Auto expand CIDR [skip ci]"
-            git push origin main
+            git push origin main --force-with-lease
           fi
