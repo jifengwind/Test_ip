@@ -59,7 +59,7 @@ jobs:
           echo "=== 随机采样加速 ==="
           
           # 随机采样 3000 个，保证 1 分钟内扫完
-          shuf -n 8000 all_ips_raw.txt > all_ips.txt 2>/dev/null || head -8000 all_ips_raw.txt > all_ips.txt
+          shuf -n 5000 all_ips_raw.txt > all_ips.txt 2>/dev/null || head -5000 all_ips_raw.txt > all_ips.txt
           
           echo "采样后待扫描数量: $(wc -l < all_ips.txt)"
 
