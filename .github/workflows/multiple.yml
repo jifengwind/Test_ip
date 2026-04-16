@@ -181,7 +181,7 @@ jobs:
           python3 << EOF
           import ipaddress
 
-          MAX_PER_CIDR = 50000  # 每 CIDR 最多取 IP 数
+          MAX_PER_CIDR = 200000  # 每 CIDR 最多取 IP 数
 
           cidrs = []
           with open('proxy_cidr.txt', 'r') as f:
