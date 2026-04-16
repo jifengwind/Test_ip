@@ -1,0 +1,290 @@
+# =============================================================================
+# CF IP Auto Select - 移动专用版（全量扫描）
+# =============================================================================
+# 只扫描移动线路的 Cloudflare IP 段，不抽样，全量测试
+# =============================================================================
+
+name: CF IP Auto Select - Mobile Only
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * *'           # 每天北京时间 02:00 执行（UTC 18:00）
+
+env:
+  # -------------------- 扫描配置 --------------------
+  # 移动线路全量 IP 约 8000-10000 个，全扫耗时约 2-5 分钟
+  OUTPUT_N: 2000                    # CloudflareST 输出的候选 IP 数量（最终取前 N 个）
+  MAX_LATENCY: 400                  # 延迟上限(ms)，超过此值的 IP 直接丢弃
+  THREADS: 60                       # 并发线程数，越高扫描越快
+  
+  # -------------------- 结果筛选配置 --------------------
+  FINAL_OUTPUT: 500                 # 最终保存到文件的最优 IP 数量
+  MAX_LOSS: 5                       # 最大丢包率(%)，超过此值的 IP 丢弃
+  
+  # -------------------- 输出端口配置 --------------------
+  DEFAULT_PORT: 443                 # 输出 IP 时使用的端口号
+
+# =============================================================================
+# 以下为执行逻辑
+# =============================================================================
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create Test_ip Directory
+        run: mkdir -p Test_ip
+
+      - name: Download CloudflareST
+        run: |
+          echo "=== 下载 CloudflareSpeedTest ==="
+          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+          tar -xzf CloudflareST_linux_amd64.tar.gz
+          chmod +x CloudflareST
+          echo "✅ 下载完成"
+
+      - name: Generate Mobile-Only IP List
+        run: |
+          echo "=== 生成移动线路专用 IP 列表 ==="
+          
+          # 下载 Cloudflare 官方 IPv4 段
+          wget -q https://www.cloudflare.com/ips-v4/ -O all_cidr.txt
+          echo "Cloudflare 总 CIDR 段数量: $(wc -l < all_cidr.txt)"
+          
+          # 移动线路的 IP 段特征（根据你脚本中的 detect_isp 逻辑）
+          python3 << EOF
+          import ipaddress
+
+          # 移动线路的特征前缀
+          MOBILE_PREFIXES = ('104.16.', '104.18.', '104.19.', '104.28.')
+
+          def is_mobile_ip(ip_str):
+              """判断 IP 是否属于移动线路"""
+              for prefix in MOBILE_PREFIXES:
+                  if ip_str.startswith(prefix):
+                      return True
+              return False
+
+          # 读取所有 CIDR
+          cidrs = []
+          with open('all_cidr.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line:
+                      try:
+                          cidrs.append(ipaddress.ip_network(line, strict=False))
+                      except:
+                          pass
+
+          print(f"有效 CIDR 段: {len(cidrs)}")
+
+          # 展开所有 CIDR，只保留移动线路的 IP
+          mobile_ips = []
+          total_checked = 0
+          
+          for net in cidrs:
+              # 跳过太大的段，避免内存爆炸（Cloudflare 最大段是 /12，约 100 万 IP）
+              # 但实际上移动 IP 只分布在特定 /24 段内，我们可以按 /24 子网过滤
+              if net.prefixlen < 20:
+                  # 大段拆分成 /24 子网再判断
+                  for subnet in net.subnets(new_prefix=24):
+                      sample_ip = str(subnet.network_address)
+                      if is_mobile_ip(sample_ip):
+                          # 这个 /24 子网属于移动线路，全部加入
+                          for ip in subnet.hosts():
+                              mobile_ips.append(str(ip))
+              else:
+                  # 小段直接判断
+                  sample_ip = str(net.network_address)
+                  if is_mobile_ip(sample_ip):
+                      for ip in net.hosts():
+                          mobile_ips.append(str(ip))
+          
+          print(f"移动线路 IP 总数: {len(mobile_ips)}")
+          
+          # 写入文件
+          with open('all_ips.txt', 'w') as f:
+              for ip in mobile_ips:
+                  f.write(ip + '\n')
+          
+          # 展示前 10 个样例
+          print("")
+          print("移动线路 IP 样例（前 10 个）:")
+          for ip in mobile_ips[:10]:
+              print(f"  {ip}")
+          EOF
+          
+          echo ""
+          echo "待扫描 IP 数量（移动线路全量）: $(wc -l < all_ips.txt)"
+
+      - name: Run CloudflareST - Delay Test
+        run: |
+          echo "=== 延迟测速 (HTTPing 模式) ==="
+          echo "配置: 候选数=${{ env.OUTPUT_N }} | 延迟上限=${{ env.MAX_LATENCY }}ms | 线程=${{ env.THREADS }}"
+          
+          ./CloudflareST \
+            -f all_ips.txt \
+            -n ${{ env.OUTPUT_N }} \
+            -t ${{ env.THREADS }} \
+            -tl ${{ env.MAX_LATENCY }} \
+            -httping \
+            -dd
+          
+          if [ ! -f result.csv ]; then
+            echo "❌ 未生成结果文件"
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== 测速完成，前 10 个结果 ==="
+          head -11 result.csv | column -t -s ','
+
+      - name: Process Results - Generate Top IPs
+        run: |
+          echo "=== 处理结果，生成优选 IP ==="
+          echo "配置: 最终输出=${{ env.FINAL_OUTPUT }} | 最大丢包=${{ env.MAX_LOSS }}%"
+          
+          cat > process_result.py << EOF
+          import csv
+          import os
+
+          DEFAULT_PORT = "${{ env.DEFAULT_PORT }}"
+          OUTPUT_COUNT = ${{ env.FINAL_OUTPUT }}
+          MAX_LOSS = ${{ env.MAX_LOSS }}
+
+          def detect_isp(ip):
+              # 因为已经只扫移动线路，这里直接返回移动
+              return '移动'
+
+          if not os.path.exists('result.csv'):
+              print("❌ 未找到 result.csv")
+              exit(1)
+
+          results = []
+          with open('result.csv', 'r', encoding='utf-8') as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  ip = row.get('IP 地址', '').strip()
+                  if not ip:
+                      continue
+                  
+                  try:
+                      latency = float(row.get('平均延迟', '0').strip() or '0')
+                  except:
+                      latency = 0
+                  
+                  try:
+                      loss_str = row.get('丢包率', '0').strip().rstrip('%')
+                      loss = float(loss_str) if loss_str else 0
+                  except:
+                      loss = 0
+                  
+                  if loss > MAX_LOSS:
+                      continue
+                  
+                  results.append({
+                      'ip': ip,
+                      'latency': latency,
+                      'loss': loss,
+                      'isp': '移动'
+                  })
+
+          print(f"读取到 {len(results)} 个有效 IP")
+
+          if len(results) == 0:
+              print("❌ 没有符合条件的 IP")
+              with open('Test_ip/best_ip.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              with open('Test_ip/result_IP.txt', 'w') as f:
+                  f.write("# No IPs found\n")
+              exit(0)
+
+          results.sort(key=lambda x: x['latency'])
+          top_results = results[:OUTPUT_COUNT]
+
+          print("")
+          print(f"=== 最终前 {OUTPUT_COUNT} 个 IP（移动线路）===")
+          print(f"{'排名':<4} {'IP地址':<18} {'运营商':<6} {'延迟(ms)':<10}")
+          print("-" * 50)
+
+          for i, r in enumerate(top_results, 1):
+              print(f"{i:<4} {r['ip']:<18} {r['isp']:<6} {r['latency']:<10.1f}")
+
+          with open('Test_ip/best_ip.txt', 'w') as f:
+              for r in top_results:
+                  f.write(f"{r['ip']}\n")
+
+          with open('Test_ip/result_IP.txt', 'w') as f:
+              for r in top_results:
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}\n")
+
+          with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
+              writer = csv.writer(f)
+              writer.writerow(['IP 地址', '端口', '运营商', '延迟(ms)', '丢包率(%)'])
+              for r in top_results:
+                  writer.writerow([r['ip'], DEFAULT_PORT, r['isp'], f"{r['latency']:.1f}", f"{r['loss']:.1f}"])
+
+          print("")
+          print(f"✅ 已保存前 {OUTPUT_COUNT} 个 IP 到 Test_ip 目录")
+          EOF
+          
+          python3 process_result.py
+          
+          echo ""
+          echo "=== 追踪 Cloudflare 边缘节点位置 ==="
+          python3 << EOF
+          import urllib.request
+          response = urllib.request.urlopen('https://cloudflare.com/cdn-cgi/trace').read().decode()
+          for line in response.split('\n'):
+              if line.startswith('loc='):
+                  print(line)
+                  break
+          EOF
+
+      - name: Show Results
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📁 Test_ip 目录内容"
+          echo "=========================================="
+          ls -la Test_ip/ || echo "目录为空"
+          echo ""
+          
+          if [ -f Test_ip/result_IP.txt ]; then
+            echo "=========================================="
+            echo "📄 result_IP.txt 内容（移动线路优选）"
+            echo "=========================================="
+            cat Test_ip/result_IP.txt
+          fi
+
+      - name: Commit and Push Results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add Test_ip/
+          
+          if git diff --cached --quiet; then
+            echo "没有变更，跳过提交"
+          else
+            git commit -m "Update CF mobile IPs - $(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+            echo "✅ 已推送到仓库"
+          fi
+
+      - name: Upload Artifacts (备用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-mobile-ip-results
+          path: Test_ip/
