@@ -30,6 +30,15 @@ jobs:
           chmod +x CloudflareST
           echo "✅ 下载完成"
 
+      - name: Check CloudflareST help
+        run: |
+          echo "=== 检查 CloudflareST 支持的参数 ==="
+          ./CloudflareST -h
+
+      - name: Create Test_ip Directory
+        run: mkdir -p Test_ip
+
+
       - name: Prepare IP List
         run: |
           echo "=== 准备 IP 列表 ==="
