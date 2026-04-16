@@ -244,12 +244,13 @@ jobs:
           EOF
           
           python3 process_result.py
-          echo""
+          
+          echo ""
           echo "=== 追踪 Cloudflare 边缘节点位置 ==="
           curl -s https://cloudflare.com/cdn-cgi/trace | grep loc
-          - name: Show Results
-          - name: Process Results
-          run: |
+
+      - name: Show Results
+        run: |
           echo ""
           echo "=========================================="
           echo "📁 Test_ip 目录内容"
