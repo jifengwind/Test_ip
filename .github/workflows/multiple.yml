@@ -44,7 +44,7 @@ on:
 env:
   # -------------------- 默认扫描配置（定时触发时使用）--------------------
   OUTPUT_N: 50000                   # CloudflareST 输出的候选 IP 数量
-  MAX_LATENCY_DEFAULT: 300          # 默认延迟上限(ms)
+  MAX_LATENCY_DEFAULT: 1000          # 默认延迟上限(ms)
   THREADS_DEFAULT: 60               # 默认并发线程数
   SCAN_MODE_DEFAULT: full           # 默认扫描模式
   
@@ -181,7 +181,7 @@ jobs:
           python3 << EOF
           import ipaddress
 
-          MAX_PER_CIDR = 2000  # 每 CIDR 最多取 IP 数
+          MAX_PER_CIDR = 50000  # 每 CIDR 最多取 IP 数
 
           cidrs = []
           with open('proxy_cidr.txt', 'r') as f:
