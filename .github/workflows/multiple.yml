@@ -223,6 +223,7 @@ jobs:
             -t ${{ steps.params.outputs.THREADS }} \
             -tl ${{ steps.params.outputs.MAX_LATENCY }} \
             -httping \
+            -trl 20 \
             -dd
           
           if [ ! -f result.csv ]; then
