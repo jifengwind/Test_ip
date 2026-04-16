@@ -30,70 +30,42 @@ jobs:
           chmod +x CloudflareST
           echo "✅ 下载完成"
 
-      - name: Prepare CIDR File
+      - name: Prepare IP List
         run: |
-          echo "=== 准备 CIDR 文件 ==="
+          echo "=== 准备 IP 列表 ==="
           
-          wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
-          echo "官方 CIDR: $(wc -l < official_cidr.txt)"
-          
-          if [ -f ipv4cidr.txt ]; then
-            echo "你的 CIDR: $(wc -l < ipv4cidr.txt)"
-            cat official_cidr.txt ipv4cidr.txt | sort -u > all_cidr_raw.txt
+          # 检查是否存在展开后的 IP 文件
+          if [ -f iplist_full.txt ]; then
+            echo "✅ 使用本地 iplist_full.txt"
+            cp iplist_full.txt all_ips.txt
           else
-            cp official_cidr.txt all_cidr_raw.txt
+            echo "⚠️ 未找到 iplist_full.txt，从官方 CIDR 生成"
+            wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
+            
+            # 如果没有 ipv4cidr.txt，只用官方
+            if [ -f ipv4cidr.txt ]; then
+              cat official_cidr.txt ipv4cidr.txt > all_cidr.txt
+            else
+              cp official_cidr.txt all_cidr.txt
+            fi
+            
+            echo "CIDR 数量: $(wc -l < all_cidr.txt)"
+            
+            # 用 CloudflareST 直接从 CIDR 扫描
+            cp all_cidr.txt all_ips.txt
           fi
           
-          echo "合并后原始 CIDR: $(wc -l < all_cidr_raw.txt)"
-
-      - name: Validate and Clean CIDR
-        run: |
-          echo "=== 验证并清理 CIDR 格式 ==="
-          
-          cat > validate_cidr.py << 'EOF'
-          import ipaddress
-          
-          valid_cidrs = set()
-          invalid_count = 0
-          
-          with open('all_cidr_raw.txt', 'r') as f:
-              for line in f:
-                  line = line.strip()
-                  if not line or line.startswith('#'):
-                      continue
-                  try:
-                      net = ipaddress.ip_network(line, strict=False)
-                      valid_cidrs.add(str(net))
-                  except ValueError:
-                      invalid_count += 1
-          
-          with open('all_cidr_clean.txt', 'w') as f:
-              for cidr in sorted(valid_cidrs):
-                  f.write(cidr + '\n')
-          
-          print(f"✅ 有效 CIDR: {len(valid_cidrs)}")
-          print(f"❌ 无效 CIDR: {invalid_count}")
-          EOF
-          
-          python3 validate_cidr.py
-          
-          # 随机采样 2000 个，加速扫描
-          shuf -n 2000 all_cidr_clean.txt > all_cidr.txt 2>/dev/null || cp all_cidr_clean.txt all_cidr.txt
-          echo "采样后 CIDR 数量: $(wc -l < all_cidr.txt)"
-          
-          if [ ! -s all_cidr.txt ]; then
-            echo "❌ 没有有效的 CIDR"
-            exit 1
-          fi
+          echo "待扫描 IP 数量: $(wc -l < all_ips.txt)"
 
       - name: Run CloudflareST - Delay Test
         run: |
-          echo "=== 延迟测速（取前 30 个） ==="
+          echo "=== 延迟测速 ==="
           
+          # CloudflareST 支持直接读取 IP 列表文件
           ./CloudflareST \
-            -f all_cidr.txt \
-            -n 30 \
-            -t 8 \
+            -f all_ips.txt \
+            -n 200 \
+            -t 32 \
             -tl 500 \
             -sl 5 \
             -dn 0
@@ -107,20 +79,33 @@ jobs:
           echo "=== 测速完成，前 10 个结果 ==="
           head -11 result.csv | column -t -s ','
 
-      - name: Process Results - Generate Top 20
+      - name: Process Results - Generate Top 40
         run: |
-          echo "=== 处理结果，生成前 20 个 IP ==="
+          echo "=== 处理结果，生成前 40 个 IP ==="
           
           cat > process_result.py << 'EOF'
           import csv
           import os
-          
+
           DEFAULT_PORT = "443"
-          
+
+          def detect_isp(ip):
+              """根据 IP 前缀判断运营商"""
+              if ip.startswith('104.16') or ip.startswith('104.18') or \
+                 ip.startswith('104.19') or ip.startswith('104.28'):
+                  return '移动'
+              if ip.startswith('172.64') or ip.startswith('172.67') or \
+                 ip.startswith('104.23') or ip.startswith('104.31'):
+                  return '联通'
+              if ip.startswith('162.159') or ip.startswith('104.20') or \
+                 ip.startswith('104.22'):
+                  return '电信'
+              return '多线'
+
           if not os.path.exists('result.csv'):
               print("❌ 未找到 result.csv")
               exit(1)
-          
+
           results = []
           with open('result.csv', 'r', encoding='utf-8') as f:
               reader = csv.DictReader(f)
@@ -140,53 +125,71 @@ jobs:
                   except:
                       loss = 0
                   
+                  # 丢包率 > 10% 的丢弃
+                  if loss > 10:
+                      continue
+                  
+                  isp = detect_isp(ip)
+                  
                   results.append({
                       'ip': ip,
                       'latency': latency,
-                      'loss': loss
+                      'loss': loss,
+                      'isp': isp
                   })
-          
-          print(f"读取到 {len(results)} 个 IP")
-          
+
+          print(f"读取到 {len(results)} 个有效 IP")
+
           if len(results) == 0:
               print("❌ 没有符合条件的 IP")
-              with open('Test_ip/best_20.txt', 'w') as f:
+              with open('Test_ip/best_40.txt', 'w') as f:
                   f.write("# No IPs found\n")
               with open('Test_ip/result_IP.txt', 'w') as f:
                   f.write("# No IPs found\n")
               exit(0)
-          
+
           # 按延迟升序
           results.sort(key=lambda x: x['latency'])
-          top20 = results[:20]
+          top40 = results[:40]
+
+          print("")
+          print("=== 最终前 40 个 IP ===")
+          print(f"{'排名':<4} {'IP地址':<18} {'运营商':<6} {'延迟(ms)':<10}")
+          print("-" * 50)
+
+          for i, r in enumerate(top40, 1):
+              print(f"{i:<4} {r['ip']:<18} {r['isp']:<6} {r['latency']:<10.1f}")
+
+          # 统计运营商分布
+          stats = {'电信': 0, '联通': 0, '移动': 0, '多线': 0}
+          for r in top40:
+              stats[r['isp']] += 1
           
           print("")
-          print("=== 最终前 20 个 IP ===")
-          print(f"{'排名':<4} {'IP地址':<18} {'延迟(ms)':<10} {'丢包率(%)':<10}")
-          print("-" * 50)
-          
-          for i, r in enumerate(top20, 1):
-              print(f"{i:<4} {r['ip']:<18} {r['latency']:<10.1f} {r['loss']:<10.1f}")
-          
-          # 保存 best_20.txt
-          with open('Test_ip/best_20.txt', 'w') as f:
-              for r in top20:
+          print("=== 运营商分布 ===")
+          for isp, count in stats.items():
+              if count > 0:
+                  print(f"  {isp}: {count}")
+
+          # 保存 best_40.txt（纯 IP）
+          with open('Test_ip/best_40.txt', 'w') as f:
+              for r in top40:
                   f.write(f"{r['ip']}\n")
-          
-          # 保存 result_IP.txt
+
+          # 保存 result_IP.txt（带端口和运营商标签）
           with open('Test_ip/result_IP.txt', 'w') as f:
-              for r in top20:
-                  f.write(f"{r['ip']}:{DEFAULT_PORT}#Cloudflare优选-{r['latency']:.0f}ms\n")
-          
+              for r in top40:
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}优选\n")
+
           # 保存 result.csv
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
-              writer.writerow(['IP 地址', '端口', '延迟(ms)', '丢包率(%)'])
-              for r in top20:
-                  writer.writerow([r['ip'], DEFAULT_PORT, f"{r['latency']:.1f}", f"{r['loss']:.1f}"])
-          
+              writer.writerow(['IP 地址', '端口', '运营商', '延迟(ms)', '丢包率(%)'])
+              for r in top40:
+                  writer.writerow([r['ip'], DEFAULT_PORT, r['isp'], f"{r['latency']:.1f}", f"{r['loss']:.1f}"])
+
           print("")
-          print(f"✅ 已保存前 20 个 IP 到 Test_ip 目录")
+          print(f"✅ 已保存前 40 个 IP 到 Test_ip 目录")
           EOF
           
           python3 process_result.py
@@ -202,17 +205,9 @@ jobs:
           
           if [ -f Test_ip/result_IP.txt ]; then
             echo "=========================================="
-            echo "📄 result_IP.txt 内容预览"
+            echo "📄 result_IP.txt 内容"
             echo "=========================================="
-            head -10 Test_ip/result_IP.txt
-          fi
-          
-          if [ -f Test_ip/best_20.txt ]; then
-            echo ""
-            echo "=========================================="
-            echo "📄 best_20.txt 内容预览"
-            echo "=========================================="
-            head -10 Test_ip/best_20.txt
+            cat Test_ip/result_IP.txt
           fi
 
       - name: Commit and Push Results
