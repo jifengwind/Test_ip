@@ -30,15 +30,6 @@ jobs:
           chmod +x CloudflareST
           echo "✅ 下载完成"
 
-      - name: Check CloudflareST help
-        run: |
-          echo "=== 检查 CloudflareST 支持的参数 ==="
-          ./CloudflareST -h
-
-      - name: Create Test_ip Directory
-        run: mkdir -p Test_ip
-
-
       - name: Prepare IP List
         run: |
           echo "=== 准备 IP 列表 ==="
@@ -46,12 +37,11 @@ jobs:
           # 检查是否存在展开后的 IP 文件
           if [ -f iplist_full.txt ]; then
             echo "✅ 使用本地 iplist_full.txt"
-            cp iplist_full.txt all_ips.txt
+            cp iplist_full.txt all_ips_raw.txt
           else
             echo "⚠️ 未找到 iplist_full.txt，从官方 CIDR 生成"
             wget -q https://www.cloudflare.com/ips-v4/ -O official_cidr.txt
             
-            # 如果没有 ipv4cidr.txt，只用官方
             if [ -f ipv4cidr.txt ]; then
               cat official_cidr.txt ipv4cidr.txt > all_cidr.txt
             else
@@ -59,26 +49,31 @@ jobs:
             fi
             
             echo "CIDR 数量: $(wc -l < all_cidr.txt)"
-            
-            # 用 CloudflareST 直接从 CIDR 扫描
-            cp all_cidr.txt all_ips.txt
+            cp all_cidr.txt all_ips_raw.txt
           fi
           
-          echo "待扫描 IP 数量: $(wc -l < all_ips.txt)"
+          echo "原始 IP/段 数量: $(wc -l < all_ips_raw.txt)"
+
+      - name: Sample IPs for Speed
+        run: |
+          echo "=== 随机采样加速 ==="
+          
+          # 随机采样 3000 个，保证 1 分钟内扫完
+          shuf -n 3000 all_ips_raw.txt > all_ips.txt 2>/dev/null || head -3000 all_ips_raw.txt > all_ips.txt
+          
+          echo "采样后待扫描数量: $(wc -l < all_ips.txt)"
 
       - name: Run CloudflareST - Delay Test
         run: |
-          echo "=== 延迟测速 ==="
+          echo "=== 延迟测速 (HTTPing 模式) ==="
           
-          # CloudflareST 支持直接读取 IP 列表文件
           ./CloudflareST \
             -f all_ips.txt \
             -n 200 \
             -t 32 \
             -tl 500 \
-            -sl 5 \
-            -dn 0
-            -p 0
+            -httping \
+            -dd
           
           if [ ! -f result.csv ]; then
             echo "❌ 未生成结果文件"
