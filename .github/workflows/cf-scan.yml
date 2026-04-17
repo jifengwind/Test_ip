@@ -81,7 +81,7 @@ jobs:
           if [ ! -f CloudflareST ]; then
             echo "=== 下载 CloudflareSpeedTest ==="
             wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_arm64.tar.gz
-            tar -xzf CloudflareST_linux_amd64.tar.gz
+            tar -xzf cfst_linux_arm64.tar.gz
             chmod +x CloudflareST
             rm CloudflareST_linux_amd64.tar.gz
             echo "✅ 下载完成"
