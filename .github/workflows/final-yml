@@ -1,5 +1,5 @@
 # =============================================================================
-# CF IP Auto Select - 深度优化精简版
+# CF IP Auto Select - 深度优化精简版 (含调试)
 # =============================================================================
 # 核心优化：
 #   ✅ 提前终止机制 - 达标即停，不再无意义等待
@@ -8,6 +8,7 @@
 #   ✅ 降低测试冗余 - OUTPUT_N 从 3000 降至 1200
 #   ✅ 优化抽样算法 - 使用 shuf 命令，极速抽样
 #   ✅ 移除冗余输出 - 只保留必要文件
+#   ✅ 调试模式 - 显示软件帮助和版本信息
 # =============================================================================
 
 name: CF IP Auto Select (Deep Optimized)
@@ -52,7 +53,7 @@ jobs:
         run: mkdir -p Test_ip
 
       # ===============================
-      # 下载 CloudflareST
+      # 下载 CloudflareST (含调试信息)
       # ===============================
       - name: Download CloudflareST
         run: |
@@ -64,7 +65,34 @@ jobs:
             rm cfst_linux_amd64.tar.gz
             echo "✅ 下载完成"
           fi
-          ./CloudflareST -v 2>/dev/null || true
+          
+          echo ""
+          echo "=========================================="
+          echo "📋 CloudflareST 版本信息"
+          echo "=========================================="
+          ./CloudflareST -v 2>&1 || true
+          
+          echo ""
+          echo "=========================================="
+          echo "📋 CloudflareST 帮助信息 (验证参数)"
+          echo "=========================================="
+          ./CloudflareST -h 2>&1 | head -50 || true
+          
+          echo ""
+          echo "=========================================="
+          echo "📋 本次测试将使用的参数"
+          echo "=========================================="
+          echo "  -f all_ips.txt          # IP列表文件"
+          echo "  -n ${{ env.OUTPUT_N }}   # 输出IP数量"
+          echo "  -t 线程数               # 每端口线程数"
+          echo "  -tl ${{ env.MAX_LATENCY }} # 延迟上限(ms)"
+          echo "  -tp 2                   # 连接超时(秒)"
+          echo "  -httping                # HTTPing模式"
+          echo "  -dd                     # 禁用下载测速"
+          echo "  -sl 8                   # 丢包率阈值"
+          echo "  -p 端口                 # 测试端口"
+          echo "  -o 文件名               # 输出文件"
+          echo ""
 
       # ===============================
       # 准备 CIDR 并极速抽样
@@ -76,9 +104,13 @@ jobs:
           # 获取 CIDR
           if [ -f ipv4cidr.txt ]; then
             cp ipv4cidr.txt all_cidr.txt
+            echo "✅ 使用本地 ipv4cidr.txt"
           else
             curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
+            echo "✅ 使用官方 CIDR"
           fi
+          
+          echo "CIDR 段数: $(wc -l < all_cidr.txt)"
           
           # 极速抽样：使用 python 快速生成所有IP，然后 shuf 随机抽取
           python3 << 'EOF' > all_ips_raw.txt
@@ -99,6 +131,8 @@ jobs:
                           pass
           EOF
           
+          echo "候选池大小: $(wc -l < all_ips_raw.txt)"
+          
           # 从候选池中随机抽取
           shuf -n ${{ env.SAMPLE_SIZE }} all_ips_raw.txt > all_ips.txt 2>/dev/null || \
           head -n ${{ env.SAMPLE_SIZE }} all_ips_raw.txt > all_ips.txt
@@ -116,11 +150,19 @@ jobs:
           PORT_COUNT=$(echo "${{ env.PORTS }}" | wc -w)
           THREADS_PER_PORT=$((${{ env.THREADS }} / PORT_COUNT))
           
+          echo "端口数: $PORT_COUNT"
+          echo "每端口线程: $THREADS_PER_PORT"
+          echo ""
+          
           # 并行执行，失败不重试
           echo "${{ env.PORTS }}" | tr ' ' '\n' | parallel -j $PORT_COUNT '
             port={}
+            echo "=========================================="
             echo "[端口 $port] 开始测试..."
+            echo "[端口 $port] 命令: ./CloudflareST -f all_ips.txt -n ${{ env.OUTPUT_N }} -t '$THREADS_PER_PORT' -tl ${{ env.MAX_LATENCY }} -tp 2 -httping -dd -sl 8 -p $port -o result_$port.csv"
+            echo "=========================================="
             
+            # 执行测试
             ./CloudflareST \
               -f all_ips.txt \
               -n ${{ env.OUTPUT_N }} \
@@ -131,20 +173,29 @@ jobs:
               -dd \
               -sl 8 \
               -p $port \
-              -o result_$port.csv 2>&1 | grep -E "测速完成|有效IP" || true
+              -o result_$port.csv 2>&1 | tee /tmp/cfst_$port.log | grep -E "测速完成|有效IP|延迟|丢包" || true
             
             if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
-              echo "[端口 $port] ✅ 完成，$(($(wc -l < result_$port.csv)-1)) 个IP"
+              count=$(($(wc -l < result_$port.csv) - 1))
+              echo "[端口 $port] ✅ 完成，获得 $count 个IP"
+              
+              # 显示前3个结果作为预览
+              echo "[端口 $port] 前3个结果:"
+              head -4 result_$port.csv | column -t -s, | head -4
             else
-              echo "[端口 $port] ❌ 失败"
+              echo "[端口 $port] ❌ 失败，查看日志:"
+              tail -10 /tmp/cfst_$port.log 2>/dev/null || echo "无日志"
             fi
+            echo ""
           '
           
           # 合并结果
+          echo "=== 合并测试结果 ==="
           > all_results.csv
           FIRST=true
           for port in ${{ env.PORTS }}; do
             if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
+              echo "合并端口 $port: $(($(wc -l < result_$port.csv) - 1)) 条"
               if [ "$FIRST" = true ]; then
                 head -1 result_$port.csv | sed 's/$/,端口/' > all_results.csv
                 FIRST=false
@@ -154,12 +205,18 @@ jobs:
             fi
           done
           
-          echo "总测试结果: $(($(wc -l < all_results.csv)-1)) 条"
+          echo ""
+          TOTAL=$(($(wc -l < all_results.csv) - 1))
+          echo "总测试结果: $TOTAL 条"
           
-          if [ $(wc -l < all_results.csv) -le 1 ]; then
+          if [ $TOTAL -le 0 ]; then
             echo "❌ 无有效结果"
             exit 1
           fi
+          
+          echo ""
+          echo "=== 汇总数据预览 (前10行) ==="
+          head -11 all_results.csv | column -t -s,
 
       # ===============================
       # 智能筛选 (精简高效版)
@@ -167,6 +224,8 @@ jobs:
       - name: Smart Filter
         run: |
           echo "=== 智能筛选 ==="
+          echo "配置: 最终输出=${{ env.FINAL_OUTPUT }} | 最大丢包=${{ env.MAX_LOSS }}% | 延迟上限=${{ env.MAX_LATENCY }}ms"
+          echo ""
           
           python3 << 'EOF'
           import csv
@@ -219,24 +278,35 @@ jobs:
               exit(1)
           
           ip_data = defaultdict(list)
+          total_rows = 0
           
           with open('all_results.csv', 'r', encoding='utf-8') as f:
               reader = csv.DictReader(f)
+              print(f"CSV列名: {reader.fieldnames}")
+              print("")
+              
               for row in reader:
+                  total_rows += 1
                   try:
                       ip = row.get('IP 地址', '').strip()
-                      delay = float(row.get('平均延迟', '999').strip() or '999')
-                      loss = float(row.get('丢包率', '100').strip().rstrip('%') or '100')
+                      delay_str = row.get('平均延迟', '999').strip()
+                      delay = float(delay_str) if delay_str else 999
+                      loss_str = row.get('丢包率', '100').strip().rstrip('%')
+                      loss = float(loss_str) if loss_str else 100
                       port = row.get('端口', '').strip()
                       
                       if loss <= MAX_LOSS and delay <= MAX_LATENCY:
                           # 计算得分 (简化版)
                           score = delay * (1 + loss / 50)
                           ip_data[ip].append((port, delay, loss, score))
-                  except:
+                  except Exception as e:
+                      if total_rows <= 5:
+                          print(f"解析错误 (行{total_rows}): {e}")
                       continue
           
+          print(f"读取总行数: {total_rows}")
           print(f"有效 IP 数: {len(ip_data)}")
+          print("")
           
           # ===============================
           # 筛选最佳
@@ -262,18 +332,31 @@ jobs:
           top = results[:FINAL_OUTPUT]
           
           print(f"最终选出: {len(top)} 个IP")
+          print("")
           
           # ===============================
           # 统计
           # ===============================
           stats = {'移动':0, '联通':0, '电信':0, '多线':0}
+          port_stats = defaultdict(int)
           for r in top:
               stats[r['isp']] += 1
+              port_stats[r['port']] += 1
           
-          print("\n=== 分布 ===")
+          print("=== 运营商分布 ===")
           for k, v in stats.items():
               if v > 0:
                   print(f"  {k}: {v} ({v*100/len(top):.1f}%)")
+          
+          print("")
+          print("=== 端口分布 ===")
+          for port, count in sorted(port_stats.items(), key=lambda x: -x[1]):
+              print(f"  端口 {port}: {count} ({count*100/len(top):.1f}%)")
+          
+          print("")
+          print("=== 前10个优选IP ===")
+          for i, r in enumerate(top[:10], 1):
+              print(f"  {i:2}. {r['ip']}:{r['port']} [{r['isp']}] 延迟:{r['delay']:.1f}ms 丢包:{r['loss']:.1f}% 得分:{r['score']:.1f}")
           
           # ===============================
           # 保存文件 (精简版)
@@ -305,7 +388,8 @@ jobs:
                   writer.writerow([i, r['ip'], r['port'], r['isp'], 
                                    f"{r['delay']:.1f}", f"{r['loss']:.1f}", f"{r['score']:.1f}"])
           
-          print("\n✅ 已保存到 Test_ip/")
+          print("")
+          print("✅ 已保存到 Test_ip/")
           EOF
 
       # ===============================
@@ -313,16 +397,18 @@ jobs:
       # ===============================
       - name: Quick Health Check
         run: |
+          echo ""
           echo "=== 快速验证前3个IP ==="
           head -3 Test_ip/result_IP.txt | while IFS=':#' read ip port isp; do
             if [ -n "$ip" ] && [ -n "$port" ]; then
+              echo -n "测试 $ip:$port ... "
               if curl -s --connect-timeout 3 --max-time 5 \
                  -o /dev/null -w "%{http_code}" \
                  --resolve speed.cloudflare.com:$port:$ip \
                  http://speed.cloudflare.com:$port/__down 2>/dev/null | grep -q "200"; then
-                echo "  ✅ $ip:$port"
+                echo "✅ 可用"
               else
-                echo "  ⚠️ $ip:$port"
+                echo "⚠️ 无响应"
               fi
             fi
           done
@@ -334,12 +420,16 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
+          echo "📁 Test_ip 目录内容"
+          echo "=========================================="
+          ls -lh Test_ip/
+          echo ""
+          echo "=========================================="
           echo "📊 优选结果 (前20个)"
           echo "=========================================="
           head -20 Test_ip/result_IP.txt
           echo ""
           echo "总IP数: $(wc -l < Test_ip/result_IP.txt)"
-          ls -lh Test_ip/
 
       # ===============================
       # 智能提交
@@ -383,7 +473,7 @@ jobs:
       # ===============================
       - name: Cleanup
         if: always()
-        run: rm -f all_ips.txt all_results.csv CloudflareST
+        run: rm -f all_ips.txt all_results.csv CloudflareST /tmp/cfst_*.log
 
       # ===============================
       # 摘要
@@ -395,11 +485,20 @@ jobs:
             echo ""
             echo "| 项目 | 值 |"
             echo "|------|-----|"
-            echo "| 时间 | $(date +'%Y-%m-%d %H:%M') |"
+            echo "| 执行时间 | $(date +'%Y-%m-%d %H:%M') |"
             echo "| 测试端口 | ${{ env.PORTS }} |"
+            echo "| 每端口线程 | $((${{ env.THREADS }} / $(echo "${{ env.PORTS }}" | wc -w))) |"
+            echo "| 每端口输出 | ${{ env.OUTPUT_N }} |"
+            echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |"
+            echo "| 最大丢包 | ${{ env.MAX_LOSS }}% |"
             echo "| 输出数量 | $(wc -l < Test_ip/result_IP.txt 2>/dev/null || echo 0) |"
             echo ""
-            echo "### 前10个IP"
+            echo "### 📋 CloudflareST 参数"
+            echo '```'
+            echo "-f all_ips.txt -n ${{ env.OUTPUT_N }} -t [线程] -tl ${{ env.MAX_LATENCY }} -tp 2 -httping -dd -sl 8 -p [端口] -o [输出]"
+            echo '```'
+            echo ""
+            echo "### 🎯 前10个优选IP"
             echo '```'
             head -10 Test_ip/result_IP.txt 2>/dev/null || echo "无数据"
             echo '```'
