@@ -1,16 +1,15 @@
 # =============================================================================
-# CF IP 极致扫描版 - 最终融合版 (抗限流优化)
+# CF IP 极致扫描版 - TCP 模式 (精简稳定版)
 # =============================================================================
-# 融合优势：
-#   ✅ 本地 ipv4cidr.txt + 社区优质段 + 官方段
-#   ✅ 动态列解析 (v3 的健壮性)
-#   ✅ 3×100 并发 (Pro 的精准控制)
-#   ✅ 使用 speed.cloudflare.com/__down?bytes=0 抗限流
-#   ✅ 自动降级到 TCP 模式
-#   ✅ 443 纯IP输出
+# 核心优化：
+#   ✅ TCP 模式 - 不会被 Cloudflare 限流
+#   ✅ 4×150=600 并发 - 速度提升 3-4 倍
+#   ✅ 延迟上限 300ms - 更严格的筛选
+#   ✅ 丢包率上限 5% - 只保留高质量 IP
+#   ✅ 本地 + 官方 + vfarid + IPDB 种子库
 # =============================================================================
 
-name: CF IP Extreme Scan Fusion
+name: CF IP Extreme Scan TCP
 
 on:
   workflow_dispatch:
@@ -18,22 +17,22 @@ on:
     - cron: '0 18 * * *'
 
 env:
-  # -------------------- 性能与平衡配置 --------------------
-  SAMPLE_SIZE: 150000               # 15万采样已足够
-  PROCESSES: 3                      # 3进程均衡双核CPU
-  THREADS_PER_PROCESS: 100          # 总计300线程，PPS限速安全点
-  PING_COUNT: 1                     
-  MAX_LATENCY: 450                  # 延迟上限450ms
-  MAX_LOSS_RATE: 0.1                # 丢包率控制在10%以内
+  # -------------------- TCP 模式高性能配置 --------------------
+  SAMPLE_SIZE: 200000               # TCP模式更快，可增加采样量
+  PROCESSES: 4                      # TCP模式可提高到4进程
+  THREADS_PER_PROCESS: 150          # 4×150=600总并发
+  PING_COUNT: 1                     # 1次足够判断端口开放
+  MAX_LATENCY: 300                  # TCP延迟上限更严格
+  MAX_LOSS_RATE: 0.05               # 丢包率控制在5%以内
   
   # -------------------- 输出配置 --------------------
-  OUTPUT_PER_PROCESS: 1000          # 总计输出 3000 个候选人
+  OUTPUT_PER_PROCESS: 1500          # 总计输出 6000 个候选人
   PORTS: "443,8443,2053,2083,2087,2096"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Code
@@ -108,7 +107,7 @@ jobs:
           import random
           import os
 
-          SAMPLE_SIZE = int(os.environ.get('SAMPLE_SIZE', 150000))
+          SAMPLE_SIZE = int(os.environ.get('SAMPLE_SIZE', 200000))
           
           cidrs = []
           with open('all_cidr.txt') as f:
@@ -154,29 +153,26 @@ jobs:
           done
 
       # ===============================
-      # 多进程并行扫描 (抗限流优化版)
+      # 多进程并行扫描 (TCP 模式)
       # ===============================
-      - name: Parallel Scan
+      - name: Parallel TCP Scan
         run: |
-          echo "=== 并行扫描 (HTTPing 模式) ==="
+          echo "=== 并行扫描 (TCP 模式) ==="
           echo "进程数: ${{ env.PROCESSES }}"
           echo "总并发: $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }}))"
           echo "延迟上限: ${{ env.MAX_LATENCY }}ms"
+          echo "丢包上限: ${{ env.MAX_LOSS_RATE }}"
           echo "端口: ${{ env.PORTS }}"
-          echo "测试地址: https://speed.cloudflare.com/__down?bytes=0"
           echo ""
           
           parallel -j ${{ env.PROCESSES }} '
             part={}
             echo "[进程 {}] 开始扫描 $(wc -l < $part) 个IP..."
             
-            # 使用 speed.cloudflare.com 的测速文件，避免触发 DDoS 防护
             ./CloudflareST \
               -f $part \
               -n ${{ env.THREADS_PER_PROCESS }} \
               -t ${{ env.PING_COUNT }} \
-              -httping \
-              -url https://www.cloudflare.com/favicon.ico
               -tl ${{ env.MAX_LATENCY }} \
               -tlr ${{ env.MAX_LOSS_RATE }} \
               -tp ${{ env.PORTS }} \
@@ -188,35 +184,16 @@ jobs:
               count=$(($(wc -l < result_{}.csv) - 1))
               echo "[进程 {}] ✅ 发现 $count 个可用组合"
             else
-              echo "[进程 {}] ⚠️ HTTPing 无结果，降级到 TCP 模式..."
-              
-              # 降级：移除 -httping，使用 TCP 模式
-              ./CloudflareST \
-                -f $part \
-                -n 50 \
-                -t 1 \
-                -tl 500 \
-                -tlr ${{ env.MAX_LOSS_RATE }} \
-                -tp ${{ env.PORTS }} \
-                -dd \
-                -p ${{ env.OUTPUT_PER_PROCESS }} \
-                -o result_{}.csv 2>&1 | tail -3
-              
-              if [ -f result_{}.csv ] && [ $(wc -l < result_{}.csv) -gt 1 ]; then
-                count=$(($(wc -l < result_{}.csv) - 1))
-                echo "[进程 {}] ✅ TCP模式发现 $count 个可用组合"
-              else
-                echo "[进程 {}] ❌ 无结果"
-              fi
+              echo "[进程 {}] ⚠️ 无结果"
             fi
           ' ::: ip_part_*
 
       # ===============================
-      # 智能合并 (动态列解析)
+      # 智能合并 (精简版)
       # ===============================
       - name: Intelligent Merge
         run: |
-          echo "=== 智能合并 (动态列解析) ==="
+          echo "=== 智能合并 ==="
           
           python3 << 'EOF'
           import os
@@ -286,7 +263,7 @@ jobs:
           # 443端口纯IP (最常用)
           ips_443 = [k.split(':')[0] for k in ip_port_list if k.endswith(':443')]
           with open('Test_ip/ips_443.txt', 'w') as f:
-              for ip in ips_443[:3000]:
+              for ip in ips_443[:5000]:
                   f.write(f"{ip}\n")
 
           print(f"\n唯一IP数: {len(ip_only)}")
@@ -301,7 +278,7 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
-          echo "📊 本次扫描结果"
+          echo "📊 本次扫描结果 (TCP模式)"
           echo "=========================================="
           echo "可用组合: $(wc -l < Test_ip/available_ips_ports.txt)"
           echo "唯一IP数: $(wc -l < Test_ip/available_ips.txt)"
@@ -350,7 +327,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cf-ips-${{ github.run_number }}
+          name: cf-ips-tcp-${{ github.run_number }}
           path: Test_ip/
           retention-days: 5
 
@@ -371,27 +348,28 @@ jobs:
           PORT443=$(wc -l < Test_ip/ips_443.txt 2>/dev/null || echo 0)
           
           {
-            echo "## 🚀 CF IP 极致扫描结果"
+            echo "## 🚀 CF IP TCP模式扫描结果"
             echo ""
             echo "| 项目 | 值 |"
             echo "|------|-----|"
             echo "| 扫描时间 | $(date +'%Y-%m-%d %H:%M') |"
+            echo "| 扫描模式 | **TCP (高速稳定)** |"
             echo "| 种子段 | 本地+官方+vfarid+IPDB |"
             echo "| 采样数 | ${{ env.SAMPLE_SIZE }} |"
             echo "| 总并发 | $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }})) |"
-            echo "| 测试地址 | speed.cloudflare.com/__down?bytes=0 |"
             echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |"
+            echo "| 丢包上限 | ${{ env.MAX_LOSS_RATE }} |"
             echo "| **可用组合** | **${TOTAL_COMBOS}** |"
             echo "| **唯一IP** | **${TOTAL_IPS}** |"
             echo "| **443端口** | **${PORT443}** |"
             echo ""
             echo "### 📋 深圳本地验证命令"
             echo '```bash'
-            echo '# 只测443端口（推荐）'
-            echo './CloudflareST -f ips_443.txt -n 200 -t 4 -dn 20 -o local.csv'
+            echo '# 直接测443端口（推荐）'
+            echo './CloudflareST -f ips_443.txt -n 200 -t 4 -dn 20 -o local_443.csv'
             echo ''
-            echo '# 测所有可用组合'
-            echo './CloudflareST -f available_ips_ports.txt -allip -n 200 -t 4 -dn 20'
+            echo '# 测所有端口组合'
+            echo './CloudflareST -f available_ips_ports.txt -allip -n 200 -t 4 -dn 20 -o local_all.csv'
             echo '```'
             echo ""
             echo "### 🎯 可用组合示例"
