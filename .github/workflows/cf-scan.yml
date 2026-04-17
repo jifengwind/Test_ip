@@ -76,18 +76,17 @@ jobs:
           path: CloudflareST
           key: cloudflarest-v2.2.5
 
-      - name: Download CloudflareST
+       - name: Download CloudflareST
         run: |
-          if [ ! -f CloudflareST ]; then
+          if [ ! -f cfst ]; then
             echo "=== 下载 CloudflareSpeedTest v2.3.4 ==="
-            # 使用您提供的新版本链接
             wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
             tar -xzf cfst_linux_amd64.tar.gz
-            chmod +x CloudflareST
+            chmod +x cfst
             rm cfst_linux_amd64.tar.gz
             echo "✅ 下载完成"
           else
-            echo "✅ 使用已存在的 CloudflareST"
+            echo "✅ 使用已存在的 cfst"
           fi
 
       # ===============================
@@ -204,7 +203,7 @@ jobs:
             
             while [ $retry -lt $max_retry ]; do
               # 执行测试
-              ./CloudflareST \
+              ./cfst \
                 -f all_ips.txt \
                 -n ${{ env.OUTPUT_N }} \
                 -t '$THREADS_PER_PORT' \
