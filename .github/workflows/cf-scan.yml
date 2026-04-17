@@ -1,17 +1,15 @@
 # =============================================================================
-# CF IP 极致扫描版 - TCP 模式 (保底修正版)
+# CF IP 极致扫描版 - TCP 模式 (完整版)
 # =============================================================================
-# 核心修正：
-#   ✅ 仅扫描 443 端口（避免非标端口被封锁）
-#   ✅ 总并发降至 200（4×50，避免 PPS 限速）
-#   ✅ 延迟上限放宽至 800ms
-#   ✅ 丢包率上限放宽至 30%
-#   ✅ 增加种子库验证和单 IP 调试
+# 核心特性：
+#   ✅ 仅扫描 443 端口
+#   ✅ 总并发 200（4×50）
 #   ✅ 超时时间 60 分钟
+#   ✅ 输出纯 IP 和 IP:443 两种格式
 #   ✅ 智能提交带冲突解决
 # =============================================================================
 
-name: CF IP Extreme Scan TCP Stable
+name: CF IP Extreme Scan TCP
 
 on:
   workflow_dispatch:
@@ -19,22 +17,22 @@ on:
     - cron: '0 18 * * *'
 
 env:
-  # -------------------- 保底修正配置 --------------------
-  SAMPLE_SIZE: 150000               # 适当降低采样量
-  PROCESSES: 4                      # 保持4进程
-  THREADS_PER_PROCESS: 50           # 降至50，总并发200
-  PING_COUNT: 2                     # 增加到2次，更准确
-  MAX_LATENCY: 800                  # 放宽至800ms
-  MAX_LOSS_RATE: 0.3                # 放宽至30%
+  # -------------------- 扫描配置 --------------------
+  SAMPLE_SIZE: 150000               # 采样量
+  PROCESSES: 4                      # 并行进程数
+  THREADS_PER_PROCESS: 50           # 每进程线程数（总并发200）
+  PING_COUNT: 2                     # 测速次数
+  MAX_LATENCY: 800                  # 延迟上限(ms)
+  MAX_LOSS_RATE: 0.3                # 丢包率上限(30%)
   
   # -------------------- 输出配置 --------------------
-  OUTPUT_PER_PROCESS: 1000          # 总计输出 4000 个候选人
+  OUTPUT_PER_PROCESS: 1000          # 每进程输出数
   PORTS: "443"                      # 仅扫描 443 端口
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60             # 超时时间设置为 60 分钟
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Code
@@ -180,11 +178,11 @@ jobs:
           done
 
       # ===============================
-      # 多进程并行扫描 (TCP 模式 - 保底参数)
+      # 多进程并行扫描
       # ===============================
       - name: Parallel TCP Scan
         run: |
-          echo "=== 并行扫描 (TCP 模式 - 保底参数) ==="
+          echo "=== 并行扫描 (TCP 模式) ==="
           echo "进程数: ${{ env.PROCESSES }}"
           echo "总并发: $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }}))"
           echo "延迟上限: ${{ env.MAX_LATENCY }}ms"
@@ -210,15 +208,13 @@ jobs:
             if [ -f result_{}.csv ] && [ $(wc -l < result_{}.csv) -gt 1 ]; then
               count=$(($(wc -l < result_{}.csv) - 1))
               echo "[进程 {}] ✅ 发现 $count 个可用IP"
-              echo "[进程 {}] 前3个结果:"
-              head -4 result_{}.csv | column -t -s,
             else
               echo "[进程 {}] ⚠️ 无结果"
             fi
           ' ::: ip_part_*
 
       # ===============================
-      # 智能合并
+      # 智能合并 (输出两种格式)
       # ===============================
       - name: Intelligent Merge
         run: |
@@ -258,16 +254,30 @@ jobs:
 
           print(f"\n✅ 去重后可用 IP: {len(ip_list)}")
 
-          # 保存结果
-          with open('Test_ip/available_ips.txt', 'w') as f:
-              for ip in ip_list:
-                  f.write(f"{ip}\n")
-          
+          # 格式1: 纯 IP (给 CloudflareST 用)
           with open('Test_ip/ips_443.txt', 'w') as f:
               for ip in ip_list[:10000]:
                   f.write(f"{ip}\n")
 
-          print(f"✅ 文件已保存到 Test_ip/")
+          # 格式2: IP:443 (给 v2ray/clash 等代理工具用)
+          with open('Test_ip/ips_443_with_port.txt', 'w') as f:
+              for ip in ip_list[:10000]:
+                  f.write(f"{ip}:443\n")
+
+          # 完整列表
+          with open('Test_ip/available_ips.txt', 'w') as f:
+              for ip in ip_list:
+                  f.write(f"{ip}\n")
+          
+          with open('Test_ip/available_ips_with_port.txt', 'w') as f:
+              for ip in ip_list:
+                  f.write(f"{ip}:443\n")
+
+          print(f"\n✅ 文件已保存:")
+          print(f"   - ips_443.txt: 纯 IP (前10000个)")
+          print(f"   - ips_443_with_port.txt: IP:443 (前10000个)")
+          print(f"   - available_ips.txt: 全部 {len(ip_list)} 个纯 IP")
+          print(f"   - available_ips_with_port.txt: 全部 {len(ip_list)} 个 IP:443")
           EOF
 
       # ===============================
@@ -284,8 +294,11 @@ jobs:
           echo ""
           
           if [ ${TOTAL} -gt 0 ]; then
-            echo "前30个可用 IP:"
-            head -30 Test_ip/available_ips.txt
+            echo "前20个可用 IP (纯 IP):"
+            head -20 Test_ip/available_ips.txt
+            echo ""
+            echo "前10个可用 IP (IP:443):"
+            head -10 Test_ip/available_ips_with_port.txt
           else
             echo "⚠️ 无可用 IP"
           fi
@@ -306,7 +319,6 @@ jobs:
               git config --local user.email "action@github.com"
               git config --local user.name "GitHub Action"
               
-              # 拉取远程更新
               echo "拉取远程更新..."
               git pull --rebase origin main 2>/dev/null || git pull origin main 2>/dev/null || echo "无远程更新或拉取失败，继续..."
               
@@ -333,7 +345,7 @@ jobs:
         with:
           name: cf-ips-tcp-${{ github.run_number }}
           path: Test_ip/
-          retention-days: 5
+          retention-days: 7
 
       # ===============================
       # 清理
@@ -363,21 +375,27 @@ jobs:
             echo ""
             
             if [ ${TOTAL} -gt 0 ]; then
-              echo "### 📋 深圳本地验证命令"
+              echo "### 📋 使用说明"
+              echo ""
+              echo "**CloudflareST 本地测速:**"
               echo '```bash'
-              echo '# 下载 ips_443.txt 后运行'
               echo './CloudflareST -f ips_443.txt -n 200 -t 4 -dn 20 -o local.csv'
+              echo '```'
+              echo ""
+              echo "**代理工具 (v2ray/clash):**"
+              echo '```'
+              echo '使用 ips_443_with_port.txt 文件'
               echo '```'
               echo ""
               echo "### 🎯 可用IP示例"
               echo '```'
-              head -20 Test_ip/available_ips.txt 2>/dev/null
+              head -15 Test_ip/available_ips.txt 2>/dev/null
               echo '```'
             else
               echo "### ⚠️ 扫描结果为 0"
               echo ""
               echo "**可能原因:**"
-              echo "1. GitHub Actions 出口 IP 被 Cloudflare 完全屏蔽"
-              echo "2. 需要进一步放宽参数或更换扫描平台"
+              echo "1. GitHub Actions 出口 IP 被 Cloudflare 屏蔽"
+              echo "2. 需要进一步放宽参数"
             fi
           } >> $GITHUB_STEP_SUMMARY
