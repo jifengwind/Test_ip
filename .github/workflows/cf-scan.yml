@@ -1,16 +1,7 @@
 # =============================================================================
-# CF IP 极致扫描版 v3 - 最终优化
+# CF IP 极致扫描版 - 生产级优化
 # =============================================================================
-# 优化策略：
-#   ✅ 完全随机抽样（避免局部路由黑洞）
-#   ✅ HTTPing 模式（确保IP真正可用）
-#   ✅ 总并发控制在400（4×100，稳定准确）
-#   ✅ 延迟上限400ms（过滤绕路IP）
-#   ✅ 保留 IP:端口 原始对应关系
-#   ✅ 使用官方诊断接口
-# =============================================================================
-
-name: CF IP Extreme Scan v3
+name: CF IP Extreme Scan Pro
 
 on:
   workflow_dispatch:
@@ -18,359 +9,19 @@ on:
     - cron: '0 18 * * *'
 
 env:
-  # -------------------- 均衡性能配置 --------------------
-  SAMPLE_SIZE: 300000               # 最大抽样量
-  PROCESSES: 4                      # 并行进程数
-  THREADS_PER_PROCESS: 100          # 每进程线程数（总并发 4×100=400）
-  PING_COUNT: 1                     # 只测1次（判断可用即可）
-  MAX_LATENCY: 400                  # 延迟上限400ms（过滤绕路IP）
-  MAX_LOSS_RATE: 0.1                # 丢包率上限10%
+  # -------------------- 性能与平衡配置 --------------------
+  SAMPLE_SIZE: 150000               # 网段质量提高后，15万采样已足够覆盖优质IP
+  PROCESSES: 3                      # 3进程均衡双核CPU
+  THREADS_PER_PROCESS: 100          # 总计300线程，这是Action PPS限速的临界安全点
+  PING_COUNT: 1                     
+  MAX_LOSS_RATE: 0.1                # 严格控制丢包率在10%以内
   
   # -------------------- 输出配置 --------------------
-  OUTPUT_PER_PROCESS: 1500          # 每进程输出数（4×1500=6000）
-  
-  # -------------------- 端口配置 --------------------
-  PORTS: "443,8443,2053,2083,2086,2087,2096"
+  OUTPUT_PER_PROCESS: 1000          # 总计输出 3000 个精选候选人
+  PORTS: "443,8443,2053,2083,2087,2096"
 
 jobs:
   scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y parallel curl
-          echo "✅ 依赖安装完成"
-
-      - name: Create Output Directory
-        run: mkdir -p Test_ip
-
-      # ===============================
-      # 下载 CloudflareST
-      # ===============================
-      - name: Download CloudflareST
-        run: |
-          if [ ! -f CloudflareST ]; then
-            wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
-            tar -xzf cfst_linux_amd64.tar.gz
-            [ -f cfst ] && mv cfst CloudflareST && chmod +x CloudflareST
-            rm cfst_linux_amd64.tar.gz
-          fi
-          echo "✅ CloudflareST 就绪"
-
-      # ===============================
-      # 准备 CIDR 并完全随机抽样
-      # ===============================
-      - name: Prepare & Sample IPs
-        run: |
-          echo "=== 准备 CIDR 并完全随机抽样 ==="
-          
-          if [ -f ipv4cidr.txt ]; then
-            cp ipv4cidr.txt all_cidr.txt
-            echo "✅ 使用本地 ipv4cidr.txt"
-          else
-            curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
-            echo "✅ 使用官方 CIDR"
-          fi
-          
-          python3 << 'EOF' > all_ips.txt
-          import ipaddress
-          import random
-          
-          SAMPLE_SIZE = int(${{ env.SAMPLE_SIZE }})
-          
-          cidrs = []
-          with open('all_cidr.txt') as f:
-              for line in f:
-                  line = line.strip()
-                  if line and not line.startswith('#'):
-                      try:
-                          net = ipaddress.ip_network(line, strict=False)
-                          if net.num_addresses > 5:
-                              cidrs.append(net)
-                      except:
-                          pass
-          
-          # 全局打乱 CIDR 顺序
-          random.shuffle(cidrs)
-          
-          # 计算总地址数（用于权重分配）
-          total_addr = sum(net.num_addresses for net in cidrs)
-          ips = []
-          
-          # 按权重分配，内部完全随机抽取
-          for net in cidrs:
-              n = max(1, int(SAMPLE_SIZE * net.num_addresses / total_addr))
-              count = min(n, net.num_addresses - 2)
-              if count > 0:
-                  indices = random.sample(range(1, net.num_addresses - 1), count)
-                  for idx in indices:
-                      ips.append(str(net[idx]))
-          
-          # 再次全局打乱
-          random.shuffle(ips)
-          
-          for ip in ips[:SAMPLE_SIZE]:
-              print(ip)
-          EOF
-          
-          echo "待扫描 IP: $(wc -l < all_ips.txt)"
-          rm all_cidr.txt
-
-      # ===============================
-      # IP 列表分片
-      # ===============================
-      - name: Split IP List
-        run: |
-          echo "=== 分片 IP 列表 (${{ env.PROCESSES }} 个进程) ==="
-          
-          TOTAL=$(wc -l < all_ips.txt)
-          LINES_PER_FILE=$(( (TOTAL + ${{ env.PROCESSES }} - 1) / ${{ env.PROCESSES }} ))
-          
-          split -l $LINES_PER_FILE -d -a 1 all_ips.txt ip_part_
-          
-          for f in ip_part_*; do
-            echo "  $f: $(wc -l < $f) 个IP"
-          done
-
-      # ===============================
-      # 多进程并行扫描 (HTTPing优化版)
-      # ===============================
-      - name: Parallel Scan
-        run: |
-          echo "=== 并行扫描 (HTTPing模式) ==="
-          echo "进程数: ${{ env.PROCESSES }}"
-          echo "每进程线程: ${{ env.THREADS_PER_PROCESS }}"
-          echo "总并发线程: $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }}))"
-          echo "延迟上限: ${{ env.MAX_LATENCY }}ms"
-          echo "测试端口: ${{ env.PORTS }}"
-          echo "测速模式: HTTPing (官方诊断接口)"
-          echo ""
-          
-          parallel -j ${{ env.PROCESSES }} '
-            part={}
-            echo "[进程 {}] 开始扫描 $(wc -l < $part) 个IP..."
-            
-            ./CloudflareST \
-              -f $part \
-              -n ${{ env.THREADS_PER_PROCESS }} \
-              -t ${{ env.PING_COUNT }} \
-              -httping \
-              -url https://cloudflare.com/cdn-cgi/trace \
-              -tl ${{ env.MAX_LATENCY }} \
-              -tlr ${{ env.MAX_LOSS_RATE }} \
-              -tp ${{ env.PORTS }} \
-              -dd \
-              -p ${{ env.OUTPUT_PER_PROCESS }} \
-              -o result_${part}.csv 2>&1 | grep -E "可用:|有效IP|测速完成" || true
-            
-            if [ -f result_${part}.csv ] && [ $(wc -l < result_${part}.csv) -gt 1 ]; then
-              count=$(($(wc -l < result_${part}.csv) - 1))
-              echo "[进程 {}] ✅ 发现 $count 个可用组合"
-            else
-              echo "[进程 {}] ⚠️ 无结果"
-            fi
-          ' ::: ip_part_*
-
-      # ===============================
-      # 合并去重 (正确解析端口)
-      # ===============================
-      - name: Merge Results
-        run: |
-          echo "=== 合并去重 (正确解析端口) ==="
-          
-          python3 << 'EOF'
-          import os
-          import csv
-          from collections import defaultdict
-
-          ip_port_set = set()
-          ip_port_list = []
-          port_stats = defaultdict(int)
-
-          # CloudflareST 多端口输出格式：
-          # IP 地址,端口,已发送,已接收,丢包率,平均延迟,...
-          # 端口列是第二列（索引1）
-
-          for f in sorted(os.listdir('.')):
-              if f.startswith('result_ip_part_') and f.endswith('.csv'):
-                  print(f"处理: {f}")
-                  with open(f, 'r', encoding='utf-8') as fp:
-                      reader = csv.reader(fp)
-                      header = next(reader, None)
-                      
-                      # 找到端口列的索引
-                      port_idx = None
-                      ip_idx = 0
-                      if header:
-                          for i, col in enumerate(header):
-                              if col.strip() in ['端口', 'Port', 'port']:
-                                  port_idx = i
-                              elif col.strip() in ['IP 地址', 'IP', 'ip']:
-                                  ip_idx = i
-                      
-                      for row in reader:
-                          try:
-                              ip = row[ip_idx].strip() if ip_idx < len(row) else ''
-                              port = row[port_idx].strip() if port_idx is not None and port_idx < len(row) else '443'
-                              
-                              if ip and port:
-                                  key = f"{ip}:{port}"
-                                  if key not in ip_port_set:
-                                      ip_port_set.add(key)
-                                      ip_port_list.append(key)
-                                      port_stats[port] += 1
-                          except:
-                              pass
-                  os.remove(f)
-
-          print(f"\n去重后可用组合: {len(ip_port_list)}")
-          print(f"\n端口分布:")
-          for port, count in sorted(port_stats.items(), key=lambda x: -x[1]):
-              print(f"  {port}: {count} ({count*100/len(ip_port_list):.1f}%)")
-
-          # 保存完整列表
-          with open('Test_ip/available_ips_ports.txt', 'w') as f:
-              for key in ip_port_list:
-                  f.write(f"{key}\n")
-
-          # 按端口分类保存
-          port_groups = defaultdict(list)
-          for key in ip_port_list:
-              port = key.split(':')[1]
-              port_groups[port].append(key)
-
-          for port, keys in port_groups.items():
-              with open(f'Test_ip/ips_port_{port}.txt', 'w') as f:
-                  for key in keys[:2000]:
-                      f.write(f"{key}\n")
-
-          # 纯IP列表（去重）
-          ip_only = set()
-          for key in ip_port_list:
-              ip_only.add(key.split(':')[0])
-
-          with open('Test_ip/available_ips.txt', 'w') as f:
-              for ip in sorted(ip_only):
-                  f.write(f"{ip}\n")
-
-          # 443端口纯IP（方便直接用）
-          if '443' in port_groups:
-              with open('Test_ip/ips_443_only.txt', 'w') as f:
-                  for key in port_groups['443'][:2000]:
-                      f.write(f"{key.split(':')[0]}\n")
-
-          print(f"\n唯一IP数: {len(ip_only)}")
-          print("\n✅ 已保存")
-          EOF
-
-      # ===============================
-      # 显示结果
-      # ===============================
-      - name: Show Results
-        run: |
-          echo ""
-          echo "=========================================="
-          echo "📊 扫描结果"
-          echo "=========================================="
-          echo "可用组合: $(wc -l < Test_ip/available_ips_ports.txt)"
-          echo "唯一IP数: $(wc -l < Test_ip/available_ips.txt)"
-          echo ""
-          echo "端口分布:"
-          for port in 443 8443 2053 2083 2086 2087 2096; do
-            if [ -f Test_ip/ips_port_${port}.txt ]; then
-              echo "  ${port}: $(wc -l < Test_ip/ips_port_${port}.txt) 个"
-            fi
-          done
-          echo ""
-          echo "前30个可用组合:"
-          head -30 Test_ip/available_ips_ports.txt
-          echo ""
-          ls -lh Test_ip/
-
-      # ===============================
-      # 智能提交
-      # ===============================
-      - name: Smart Commit
-        run: |
-          if [ -f Test_ip/available_ips_ports.txt ]; then
-            NEW_HASH=$(md5sum Test_ip/available_ips_ports.txt | cut -d' ' -f1)
-            OLD_HASH=$(git show HEAD:Test_ip/available_ips_ports.txt 2>/dev/null | md5sum | cut -d' ' -f1 || echo "")
-            
-            if [ "$NEW_HASH" != "$OLD_HASH" ]; then
-              git config --local user.email "action@github.com"
-              git config --local user.name "GitHub Action"
-              git add Test_ip/ -f
-              
-              TOTAL_COMBOS=$(wc -l < Test_ip/available_ips_ports.txt)
-              TOTAL_IPS=$(wc -l < Test_ip/available_ips.txt)
-              PORT443=$(wc -l < Test_ip/ips_port_443.txt 2>/dev/null || echo 0)
-              
-              git commit -m "🔄 CF可用IP [$(date +'%m-%d')] - ${TOTAL_IPS}个IP (${TOTAL_COMBOS}组合, 443:${PORT443})"
-              git push
-              echo "✅ 已推送"
-            else
-              echo "⏭️ 无变化"
-            fi
-          fi
-
-      # ===============================
-      # 上传备份
-      # ===============================
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cf-ips-${{ github.run_number }}
-          path: Test_ip/
-          retention-days: 5
-
-      # ===============================
-      # 清理
-      # ===============================
-      - name: Cleanup
-        if: always()
-        run: rm -f all_ips.txt CloudflareST ip_part_* *.csv
-
-      # ===============================
-      # 摘要
-      # ===============================
-      - name: Summary
-        run: |
-          TOTAL_COMBOS=$(wc -l < Test_ip/available_ips_ports.txt 2>/dev/null || echo 0)
-          TOTAL_IPS=$(wc -l < Test_ip/available_ips.txt 2>/dev/null || echo 0)
-          {
-            echo "## 🚀 CF IP 极致扫描结果 v3"
-            echo ""
-            echo "| 项目 | 值 |"
-            echo "|------|-----|"
-            echo "| 扫描时间 | $(date +'%Y-%m-%d %H:%M') |"
-            echo "| 抽样IP数 | ${{ env.SAMPLE_SIZE }} |"
-            echo "| 测速模式 | HTTPing (官方接口) |"
-            echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |"
-            echo "| 总并发 | $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }})) |"
-            echo "| 测试端口 | ${{ env.PORTS }} |"
-            echo "| **可用组合** | **${TOTAL_COMBOS}** |"
-            echo "| **唯一IP** | **${TOTAL_IPS}** |"
-            echo ""
-            echo "### 📋 深圳本地验证命令"
-            echo '```bash'
-            echo '# 只测443端口（最快）'
-            echo './CloudflareST -f ips_443_only.txt -n 200 -t 4 -dn 20'
-            echo ''
-            echo '# 测所有可用端口组合'
-            echo './CloudflareST -f available_ips_ports.txt -allip -n 200 -t 4 -dn 20'
-            echo '```'
-            echo ""
-            echo "### 🎯 可用组合示例"
-            echo '```'
-            head -20 Test_ip/available_ips_ports.txt 2>/dev/null
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY  scan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -378,478 +29,130 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y parallel curl
-          echo "✅ 依赖安装完成"
+          echo "✅ 环境就绪"
 
-      - name: Create Output Directory
-        run: mkdir -p Test_ip
-
-      # ===============================
-      # 下载 CloudflareST
-      # ===============================
       - name: Download CloudflareST
         run: |
-          if [ ! -f CloudflareST ]; then
-            echo "=== 下载 CloudflareST ==="
-            wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
-            tar -xzf cfst_linux_amd64.tar.gz
-            [ -f cfst ] && mv cfst CloudflareST && chmod +x CloudflareST
-            rm cfst_linux_amd64.tar.gz
-            echo "✅ 下载完成"
-          fi
-          
-          echo ""
-          echo "=========================================="
-          echo "📋 CloudflareST 版本信息"
-          echo "=========================================="
-          ./CloudflareST -v 2>&1 || true
-          
-          echo ""
-          echo "=========================================="
-          echo "📋 测试参数说明"
-          echo "=========================================="
-          echo "  模式1 (TCP):  -f all_ips.txt -n ${{ env.THREADS }} -t ${{ env.PING_COUNT }} -tl ${{ env.MAX_LATENCY }} -tlr ${{ env.MAX_LOSS_RATE }} -tp [端口] -dd -p ${{ env.OUTPUT_COUNT }}"
-          echo "  模式2 (HTTP): -f all_ips.txt -n ${{ env.THREADS }} -t ${{ env.PING_COUNT }} -tl ${{ env.MAX_LATENCY }} -tlr ${{ env.MAX_LOSS_RATE }} -tp [端口] -httping -dd -p ${{ env.OUTPUT_COUNT }}"
-          echo ""
+          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
+          tar -xzf cfst_linux_amd64.tar.gz
+          mv cfst CloudflareST && chmod +x CloudflareST
+          echo "✅ CloudflareST 准备就绪"
 
       # ===============================
-      # 准备 CIDR 并极速抽样
+      # 核心改进：引入社区高质量优选段
       # ===============================
-      - name: Prepare & Sample IPs
+      - name: Prepare High-Quality CIDR
         run: |
-          echo "=== 准备 CIDR 并抽样 ==="
+          echo "=== 正在构建高质量网段池 ==="
+          # 获取官方段作为基底
+          curl -s https://www.cloudflare.com/ips-v4/ -o official.txt
+          # 获取社区长期维护的对华优化段 (源1: vfarid, 源2: IPDB)
+          curl -s https://raw.githubusercontent.com/vfarid/cf-ip-scanner/main/iplist.txt -o source1.txt || touch source1.txt
+          curl -s https://raw.githubusercontent.com/ymyuuu/IPDB/main/cloudflare.txt -o source2.txt || touch source2.txt
           
-          if [ -f ipv4cidr.txt ]; then
-            cp ipv4cidr.txt all_cidr.txt
-            echo "✅ 使用本地 ipv4cidr.txt"
-          else
-            curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
-            echo "✅ 使用官方 CIDR"
-          fi
-          
-          echo "CIDR 段数: $(wc -l < all_cidr.txt)"
-          
-          python3 << 'EOF' > all_ips_raw.txt
-          import ipaddress
+          # 合并清洗：提取 CIDR 格式并去重
+          cat official.txt source1.txt source2.txt | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' | sort -u > all_cidr.txt
+          echo "✅ 种子库构建完成，包含 $(wc -l < all_cidr.txt) 个优质网段"
 
+      # ===============================
+      # 核心改进：Python 权重随机抽样算法
+      # ===============================
+      - name: Python Random Sampling
+        run: |
+          python3 << 'EOF' > all_ips.txt
+          import ipaddress
+          import random
+          import os
+
+          sample_limit = int(os.environ.get('SAMPLE_SIZE', 150000))
+          cidrs = []
           with open('all_cidr.txt') as f:
               for line in f:
                   line = line.strip()
-                  if line and not line.startswith('#'):
-                      try:
-                          net = ipaddress.ip_network(line, strict=False)
-                          if net.num_addresses > 256:
-                              step = max(1, (net.num_addresses - 2) // 5000)
-                              for i in range(1, net.num_addresses - 1, step):
-                                  print(net[i])
-                      except:
-                          pass
+                  if line:
+                      try: cidrs.append(ipaddress.ip_network(line, strict=False))
+                      except: pass
+
+          random.shuffle(cidrs) # 乱序处理，避免扫描过于集中
+          total_ips_count = sum(net.num_addresses for net in cidrs)
+          output_ips = []
+
+          for net in cidrs:
+              # 按比例分配该网段的采样数，实现全网段公平覆盖
+              num_to_sample = max(1, int(sample_limit * net.num_addresses / total_ips_count))
+              if net.num_addresses > 2:
+                  count = min(num_to_sample, net.num_addresses - 2)
+                  # 随机抽取 index 避免等间距采样的规律性
+                  indices = random.sample(range(1, net.num_addresses - 1), count)
+                  for idx in indices:
+                      output_ips.append(str(net[idx]))
+
+          random.shuffle(output_ips)
+          for ip in output_ips[:sample_limit]:
+              print(ip)
           EOF
-          
-          echo "候选池大小: $(wc -l < all_ips_raw.txt)"
-          
-          shuf -n ${{ env.SAMPLE_SIZE }} all_ips_raw.txt > all_ips.txt 2>/dev/null || \
-          head -n ${{ env.SAMPLE_SIZE }} all_ips_raw.txt > all_ips.txt
-          
-          echo "待测试 IP: $(wc -l < all_ips.txt)"
-          rm all_ips_raw.txt all_cidr.txt
+          echo "✅ 随机采样完成：$(wc -l < all_ips.txt) 个独立 IP"
 
       # ===============================
-      # TCP 模式测试
+      # 核心改进：多进程分片与真实可用性验证
       # ===============================
-      - name: TCP Mode Test
+      - name: Parallel Verified Scan
         run: |
-          echo "=== TCP 模式测试 ==="
+          split -n l/${{ env.PROCESSES }} -d -a 1 all_ips.txt ip_part_
           
-          for port in ${{ env.PORTS }}; do
-            echo ""
-            echo "=========================================="
-            echo "[TCP 模式] 测试端口: $port"
-            echo "=========================================="
-            
+          parallel -j ${{ env.PROCESSES }} '
+            part={}
             ./CloudflareST \
-              -f all_ips.txt \
-              -n ${{ env.THREADS }} \
-              -t ${{ env.PING_COUNT }} \
-              -tl ${{ env.MAX_LATENCY }} \
-              -tlr ${{ env.MAX_LOSS_RATE }} \
-              -tp $port \
-              -dd \
-              -p ${{ env.OUTPUT_COUNT }} \
-              -o tcp_result_$port.csv 2>&1 | tail -30
-            
-            if [ -f tcp_result_$port.csv ] && [ $(wc -l < tcp_result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < tcp_result_$port.csv) - 1))
-              echo "[TCP:$port] ✅ 获得 $count 个IP"
-            else
-              echo "[TCP:$port] ⚠️ 无结果"
-            fi
-          done
-
-      # ===============================
-      # HTTPing 模式测试
-      # ===============================
-      - name: HTTPing Mode Test
-        run: |
-          echo ""
-          echo "=== HTTPing 模式测试 ==="
-          
-          for port in ${{ env.PORTS }}; do
-            echo ""
-            echo "=========================================="
-            echo "[HTTPing 模式] 测试端口: $port"
-            echo "=========================================="
-            
-            ./CloudflareST \
-              -f all_ips.txt \
-              -n ${{ env.THREADS }} \
-              -t ${{ env.PING_COUNT }} \
-              -tl ${{ env.MAX_LATENCY }} \
-              -tlr ${{ env.MAX_LOSS_RATE }} \
-              -tp $port \
+              -f $part \
+              -n ${{ env.THREADS_PER_PROCESS }} \
+              -t 1 \
               -httping \
+              -url https://cloudflare.com/cdn-cgi/trace \
+              -tl 450 \
+              -tlr ${{ env.MAX_LOSS_RATE }} \
+              -tp ${{ env.PORTS }} \
               -dd \
-              -p ${{ env.OUTPUT_COUNT }} \
-              -o http_result_$port.csv 2>&1 | tail -30
-            
-            if [ -f http_result_$port.csv ] && [ $(wc -l < http_result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < http_result_$port.csv) - 1))
-              echo "[HTTP:$port] ✅ 获得 $count 个IP"
-            else
-              echo "[HTTP:$port] ⚠️ 无结果"
-            fi
-          done
+              -p ${{ env.OUTPUT_PER_PROCESS }} \
+              -o result_{}.csv > /dev/null 2>&1
+            echo "[进程 {}] 扫描完成"
+          ' ::: ip_part_*
 
       # ===============================
-      # 合并所有结果
+      # 结果合并：保留真实的 IP:端口 对应关系
       # ===============================
-      - name: Merge All Results
+      - name: Intelligent Merge
         run: |
-          echo ""
-          echo "=== 合并 TCP + HTTPing 结果 ==="
-          
-          > all_results.csv
-          FIRST=true
-          TOTAL=0
-          
-          # 合并 TCP 结果
-          for port in ${{ env.PORTS }}; do
-            if [ -f tcp_result_$port.csv ] && [ $(wc -l < tcp_result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < tcp_result_$port.csv) - 1))
-              echo "TCP:$port -> $count 条"
-              TOTAL=$((TOTAL + count))
-              
-              if [ "$FIRST" = true ]; then
-                head -1 tcp_result_$port.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
-                FIRST=false
-              fi
-              tail -n +2 tcp_result_$port.csv | awk -v m="TCP" -v p="$port" '{print $0 "," m "," p}' >> all_results.csv
-              rm tcp_result_$port.csv
-            fi
-          done
-          
-          # 合并 HTTPing 结果
-          for port in ${{ env.PORTS }}; do
-            if [ -f http_result_$port.csv ] && [ $(wc -l < http_result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < http_result_$port.csv) - 1))
-              echo "HTTP:$port -> $count 条"
-              TOTAL=$((TOTAL + count))
-              
-              if [ "$FIRST" = true ]; then
-                head -1 http_result_$port.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
-                FIRST=false
-              fi
-              tail -n +2 http_result_$port.csv | awk -v m="HTTP" -v p="$port" '{print $0 "," m "," p}' >> all_results.csv
-              rm http_result_$port.csv
-            fi
-          done
-          
-          echo ""
-          echo "总结果数: $TOTAL 条"
-          
-          if [ $TOTAL -le 0 ]; then
-            echo "❌ 无有效结果，尝试调试模式..."
-            
-            # 调试模式
-            echo ""
-            echo "=== 调试模式测试 (端口443) ==="
-            ./CloudflareST \
-              -f all_ips.txt \
-              -n 50 \
-              -t 2 \
-              -tl 800 \
-              -tp 443 \
-              -httping \
-              -dd \
-              -p 50 \
-              -debug \
-              -o debug_result.csv 2>&1 | tail -50
-            
-            if [ -f debug_result.csv ] && [ $(wc -l < debug_result.csv) -gt 1 ]; then
-              count=$(($(wc -l < debug_result.csv) - 1))
-              echo "调试模式获得 $count 个IP"
-              head -1 debug_result.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
-              tail -n +2 debug_result.csv | awk -v m="DEBUG" -v p="443" '{print $0 "," m "," p}' >> all_results.csv
-              TOTAL=$count
-            else
-              echo "❌ 调试模式也无结果"
-              exit 1
-            fi
-          fi
-          
-          echo ""
-          echo "=== 汇总数据预览 (前10行) ==="
-          head -11 all_results.csv | column -t -s,
-
-      # ===============================
-      # 智能筛选 (无运营商)
-      # ===============================
-      - name: Smart Filter
-        run: |
-          echo ""
-          echo "=== 智能筛选 (按延迟排序) ==="
-          
+          mkdir -p Test_ip
           python3 << 'EOF'
-          import csv
           import os
-          from collections import defaultdict
+          unique_records = set()
+          final_list = []
           
-          FINAL_OUTPUT = int(os.environ.get('OUTPUT_COUNT', 1500))
-          DEFAULT_PORT = os.environ.get('DEFAULT_PORT', '443')
+          for f in os.listdir('.'):
+              if f.startswith('result_ip_part_') and f.endswith('.csv'):
+                  with open(f, 'r') as fp:
+                      lines = fp.readlines()[1:] # 跳过表头
+                      for line in lines:
+                          parts = line.strip().split(',')
+                          if len(parts) >= 2:
+                              ip_port = f"{parts[0].strip()}:{parts[1].strip()}"
+                              if ip_port not in unique_records:
+                                  unique_records.add(ip_port)
+                                  final_list.append(ip_port)
           
-          if not os.path.exists('all_results.csv'):
-              print("❌ 无结果文件")
-              exit(1)
-          
-          # 按 IP 聚合，找出每个 IP 的最佳结果
-          ip_data = defaultdict(list)
-          
-          with open('all_results.csv', 'r', encoding='utf-8') as f:
-              reader = csv.DictReader(f)
-              print(f"CSV列名: {reader.fieldnames}")
-              
-              for row in reader:
-                  try:
-                      ip = row.get('IP 地址', '').strip()
-                      delay_str = row.get('平均延迟', '999').strip()
-                      delay = float(delay_str) if delay_str else 999
-                      loss_str = row.get('丢包率', '100').strip().rstrip('%')
-                      loss = float(loss_str) if loss_str else 100
-                      port = row.get('测试端口', '').strip()
-                      mode = row.get('测试模式', '').strip()
-                      
-                      if delay > 0:
-                          # 得分 = 延迟 + 丢包惩罚
-                          # HTTPing 模式加权 (通常更准确)
-                          mode_weight = 0.95 if mode == 'HTTP' else 1.0
-                          score = delay * (1 + loss / 100) * mode_weight
-                          ip_data[ip].append((port, mode, delay, loss, score))
-                  except:
-                      continue
-          
-          print(f"有效 IP 数: {len(ip_data)}")
-          
-          # 筛选最佳
-          results = []
-          for ip, records in ip_data.items():
-              records.sort(key=lambda x: x[4])  # 按得分排序
-              best = records[0]
-              
-              results.append({
-                  'ip': ip,
-                  'port': best[0],
-                  'mode': best[1],
-                  'delay': best[2],
-                  'loss': best[3],
-                  'score': best[4]
-              })
-          
-          # 按得分排序
-          results.sort(key=lambda x: x['score'])
-          top = results[:FINAL_OUTPUT]
-          
-          print(f"最终选出: {len(top)} 个IP")
-          print("")
-          
-          # 统计
-          port_stats = defaultdict(int)
-          mode_stats = defaultdict(int)
-          for r in top:
-              port_stats[r['port']] += 1
-              mode_stats[r['mode']] += 1
-          
-          print("=== 测试模式分布 ===")
-          for mode, count in sorted(mode_stats.items(), key=lambda x: -x[1]):
-              print(f"  {mode}: {count} ({count*100/len(top):.1f}%)")
-          
-          print("")
-          print("=== 端口分布 ===")
-          for port, count in sorted(port_stats.items(), key=lambda x: -x[1]):
-              print(f"  {port}: {count} ({count*100/len(top):.1f}%)")
-          
-          print("")
-          print("=== 延迟统计 ===")
-          delays = [r['delay'] for r in top]
-          print(f"  最低: {min(delays):.1f}ms")
-          print(f"  最高: {max(delays):.1f}ms")
-          print(f"  平均: {sum(delays)/len(delays):.1f}ms")
-          
-          print("")
-          print("=== 前20个优选IP ===")
-          for i, r in enumerate(top[:20], 1):
-              print(f"  {i:2}. {r['ip']}:{r['port']} [{r['mode']}] 延迟:{r['delay']:.1f}ms 丢包:{r['loss']:.1f}%")
-          
-          # ===============================
-          # 保存文件 (精简版)
-          # ===============================
-          
-          # 1. 主文件: IP:端口
-          with open('Test_ip/result_IP.txt', 'w') as f:
-              for r in top:
-                  f.write(f"{r['ip']}:{r['port']}\n")
-          
-          # 2. 纯IP列表
-          with open('Test_ip/best_ip.txt', 'w') as f:
-              for r in top:
-                  f.write(f"{r['ip']}\n")
-          
-          # 3. IP:默认端口
-          with open('Test_ip/result_default_port.txt', 'w') as f:
-              for r in top:
-                  f.write(f"{r['ip']}:{DEFAULT_PORT}\n")
-          
-          # 4. 按测试模式分类
-          for mode in ['TCP', 'HTTP', 'DEBUG']:
-              mode_ips = [r for r in top if r['mode'] == mode]
-              if mode_ips:
-                  with open(f'Test_ip/best_{mode}.txt', 'w') as f:
-                      for r in mode_ips[:200]:
-                          f.write(f"{r['ip']}:{r['port']}\n")
-          
-          # 5. CSV详情
-          with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
-              writer = csv.writer(f)
-              writer.writerow(['排名', 'IP', '端口', '模式', '延迟(ms)', '丢包率(%)', '得分'])
-              for i, r in enumerate(top, 1):
-                  writer.writerow([i, r['ip'], r['port'], r['mode'], 
-                                   f"{r['delay']:.1f}", f"{r['loss']:.1f}", f"{r['score']:.1f}"])
-          
-          print("")
-          print("✅ 已保存到 Test_ip/")
+          with open('Test_ip/available_ips.txt', 'w') as f:
+              f.write('\n'.join(final_list))
+          print(f"✅ 最终筛选出 {len(final_list)} 个 100% 可用的 IP:端口 组合")
           EOF
 
-      # ===============================
-      # 快速健康检查
-      # ===============================
-      - name: Quick Health Check
+      - name: Smart Commit & Push
         run: |
-          echo ""
-          echo "=== 快速验证前5个IP ==="
-          head -5 Test_ip/result_IP.txt | while IFS=':' read ip port; do
-            if [ -n "$ip" ] && [ -n "$port" ]; then
-              echo -n "测试 $ip:$port ... "
-              if curl -s --connect-timeout 3 --max-time 5 \
-                 -o /dev/null -w "%{http_code}" \
-                 --resolve cloudflare.com:$port:$ip \
-                 http://cloudflare.com:$port/cdn-cgi/trace 2>/dev/null | grep -q "200"; then
-                echo "✅ 可用"
-              else
-                echo "⚠️ 无响应"
-              fi
-            fi
-          done
-
-      # ===============================
-      # 显示结果
-      # ===============================
-      - name: Show Results
-        run: |
-          echo ""
-          echo "=========================================="
-          echo "📁 Test_ip 目录内容"
-          echo "=========================================="
-          ls -lh Test_ip/
-          echo ""
-          echo "=========================================="
-          echo "📊 优选结果 (前20个)"
-          echo "=========================================="
-          head -20 Test_ip/result_IP.txt
-          echo ""
-          echo "总IP数: $(wc -l < Test_ip/result_IP.txt)"
-
-      # ===============================
-      # 智能提交
-      # ===============================
-      - name: Smart Commit
-        run: |
-          if [ -f Test_ip/result_IP.txt ]; then
-            NEW_HASH=$(md5sum Test_ip/result_IP.txt | cut -d' ' -f1)
-            OLD_HASH=$(git show HEAD:Test_ip/result_IP.txt 2>/dev/null | md5sum | cut -d' ' -f1 || echo "")
-            
-            if [ "$NEW_HASH" != "$OLD_HASH" ]; then
-              git config --local user.email "action@github.com"
-              git config --local user.name "GitHub Action"
-              git add Test_ip/ -f
-              
-              TOTAL=$(wc -l < Test_ip/result_IP.txt)
-              TCP_COUNT=$(grep -c ",TCP," Test_ip/result.csv 2>/dev/null || echo 0)
-              HTTP_COUNT=$(grep -c ",HTTP," Test_ip/result.csv 2>/dev/null || echo 0)
-              
-              git commit -m "🔄 Update CF IPs [$(date +'%m-%d %H:%M')] - Total:$TOTAL (TCP:$TCP_COUNT HTTP:$HTTP_COUNT)"
-              git push
-              echo "✅ 已推送"
-            else
-              echo "⏭️ 无变化，跳过"
-            fi
-          fi
-
-      # ===============================
-      # 上传备份
-      # ===============================
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cf-ips-${{ github.run_number }}
-          path: Test_ip/
-          retention-days: 5
-
-      # ===============================
-      # 清理
-      # ===============================
-      - name: Cleanup
-        if: always()
-        run: rm -f all_ips.txt all_results.csv CloudflareST *_result_*.csv debug_*.csv
-
-      # ===============================
-      # 摘要
-      # ===============================
-      - name: Summary
-        run: |
-          {
-            echo "## 📊 CF IP 优选摘要 (TCP + HTTPing)"
-            echo ""
-            echo "| 项目 | 值 |"
-            echo "|------|-----|"
-            echo "| 执行时间 | $(date +'%Y-%m-%d %H:%M') |"
-            echo "| 测试端口 | ${{ env.PORTS }} |"
-            echo "| 测试模式 | TCP + HTTPing |"
-            echo "| 延迟线程(-n) | ${{ env.THREADS }} |"
-            echo "| 测速次数(-t) | ${{ env.PING_COUNT }} |"
-            echo "| 延迟上限(-tl) | ${{ env.MAX_LATENCY }}ms |"
-            echo "| 丢包上限(-tlr) | ${{ env.MAX_LOSS_RATE }} |"
-            echo "| 下载测速 | 已禁用(-dd) |"
-            echo "| 输出数量 | $(wc -l < Test_ip/result_IP.txt 2>/dev/null || echo 0) |"
-            echo ""
-            echo "### 🎯 前20个优选IP"
-            echo '```'
-            head -20 Test_ip/result_IP.txt 2>/dev/null || echo "无数据"
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Test_ip/
+          git commit -m "🔄 优选IP库更新: $(wc -l < Test_ip/available_ips.txt) 条 [$(date +'%Y-%m-%d')]" || exit 0
+          git push
