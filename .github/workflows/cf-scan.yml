@@ -1,4 +1,4 @@
-name: CF IP Auto Select (Multi-Region Fusion)
+name: CF IP Auto Select (Multi-Port Optimized)
 
 on:
   workflow_dispatch:
@@ -6,8 +6,8 @@ on:
     - cron: '0 18 * * *'
 
 env:
-  SAMPLE_SIZE: 200000
-  OUTPUT_N: 5000
+  SAMPLE_SIZE: 300000
+  OUTPUT_N: 8000
   FINAL_OUTPUT: 1000
 
   THREADS: 100
@@ -17,184 +17,127 @@ env:
   PORTS: "443 8443 2053 2083"
 
 jobs:
-
-# ===============================
-# 🟢 Job1：亚洲（日本）
-# ===============================
-  asia:
+  scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Download CFST
+      # ===============================
+      # 下载 CloudflareST
+      # ===============================
+      - name: Download CloudflareST
         run: |
           wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
           tar -xzf CloudflareST_linux_amd64.tar.gz
           chmod +x CloudflareST
 
+      # ===============================
+      # 获取 CIDR
+      # ===============================
       - name: Get CIDR
-        run: curl -s https://www.cloudflare.com/ips-v4 > cidr.txt
+        run: |
+          curl -s https://www.cloudflare.com/ips-v4 > cidr.txt
+          wc -l cidr.txt
 
+      # ===============================
+      # 高效抽样
+      # ===============================
       - name: Generate IPs
         run: |
           python3 << 'EOF'
           import ipaddress, random
-          SAMPLE = int("${{ env.SAMPLE_SIZE }}")
+
+          SAMPLE_SIZE = int("${{ env.SAMPLE_SIZE }}")
+
           cidrs = [ipaddress.ip_network(x.strip()) for x in open("cidr.txt") if x.strip()]
           weights = [c.num_addresses for c in cidrs]
-          s=set()
-          while len(s)<SAMPLE:
-              net=random.choices(cidrs,weights=weights)[0]
-              s.add(str(net[random.randint(1, net.num_addresses-2)]))
-          open("ips.txt","w").write("\n".join(s))
+
+          result = set()
+
+          while len(result) < SAMPLE_SIZE:
+              net = random.choices(cidrs, weights=weights, k=1)[0]
+              ip = net[random.randint(1, net.num_addresses-2)]
+              result.add(str(ip))
+
+          open("ips.txt","w").write("\n".join(result))
+          print("生成IP:", len(result))
           EOF
 
-      - name: TCP Filter
+      # ===============================
+      # TCP预筛（多端口）
+      # ===============================
+      - name: TCP Pre-filter
         run: |
-          sudo apt-get install -y masscan
-          sudo masscan -p443 -iL ips.txt --rate 8000 -oL tcp.txt
-          awk '/open/ {print $4}' tcp.txt | sort -u > alive.txt
+          sudo apt-get update && sudo apt-get install -y masscan
 
-      - name: Multi-Port Test
+          sudo masscan -p443,8443,2053,2083 \
+            -iL ips.txt \
+            --rate 8000 \
+            -oL tcp.txt
+
+          awk '/open/ {print $4}' tcp.txt | sort -u > tcp_alive.txt
+
+          echo "TCP存活IP:"
+          wc -l tcp_alive.txt
+
+      # ===============================
+      # 多端口 httping 测试
+      # ===============================
+      - name: Multi-port Test
         run: |
-          > result_all.csv
-          for p in ${{ env.PORTS }}; do
-            ./CloudflareST -f alive.txt -p $p -n ${{ env.OUTPUT_N }} -t ${{ env.THREADS }} -tl ${{ env.MAX_LATENCY }} -httping -sl 8
-            sed "1d" result.csv | awk -F',' -v port=$p '{print $0","port}' >> result_all.csv
+          > all_results.csv
+
+          for port in ${{ env.PORTS }}
+          do
+            echo "=== 测试端口 $port ==="
+
+            ./CloudflareST \
+              -f tcp_alive.txt \
+              -n ${{ env.OUTPUT_N }} \
+              -t ${{ env.THREADS }} \
+              -tl ${{ env.MAX_LATENCY }} \
+              -httping \
+              -dd \
+              -sl 8 \
+              -p $port
+
+            if [ -f result.csv ]; then
+              tail -n +2 result.csv >> all_results.csv
+            fi
           done
 
-      - name: Save
-        run: mv result_all.csv asia.csv
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: asia
-          path: asia.csv
-
-
-# ===============================
-# 🔵 Job2：美国
-# ===============================
-  us:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install & Run
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget masscan
-
-          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
-          tar -xzf CloudflareST_linux_amd64.tar.gz
-          chmod +x CloudflareST
-
-          curl -s https://www.cloudflare.com/ips-v4 > cidr.txt
-
-          python3 << 'EOF'
-          import ipaddress, random
-          SAMPLE=150000
-          cidrs=[ipaddress.ip_network(x.strip()) for x in open("cidr.txt")]
-          weights=[c.num_addresses for c in cidrs]
-          s=set()
-          while len(s)<SAMPLE:
-              net=random.choices(cidrs,weights=weights)[0]
-              s.add(str(net[random.randint(1, net.num_addresses-2)]))
-          open("ips.txt","w").write("\n".join(s))
-          EOF
-
-          sudo masscan -p443 -iL ips.txt --rate 8000 -oL tcp.txt
-          awk '/open/ {print $4}' tcp.txt | sort -u > alive.txt
-
-          > result_all.csv
-          for p in 443 8443 2053 2083; do
-            ./CloudflareST -f alive.txt -p $p -n 3000 -t 80 -tl 300 -httping -sl 8
-            sed "1d" result.csv | awk -F',' -v port=$p '{print $0","port}' >> result_all.csv
-          done
-
-          mv result_all.csv us.csv
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: us
-          path: us.csv
-
-
-# ===============================
-# 🟣 Job3：结果融合（核心）
-# ===============================
-  merge:
-    needs: [asia, us]
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: data
-
-      - name: Merge & Score
+      # ===============================
+      # 结果处理（多端口融合）
+      # ===============================
+      - name: Process Results
         run: |
           python3 << 'EOF'
-          import csv, os
+          import csv
 
           FINAL = int("${{ env.FINAL_OUTPUT }}")
           MAX_LOSS = float("${{ env.MAX_LOSS }}")
 
-          merged = {}
+          results = {}
 
-          def load(file):
-              with open(file) as f:
-                  reader = csv.reader(f)
-                  for r in reader:
-                      try:
-                          ip = r[0]
-                          delay = float(r[1])
-                          loss = float(r[2].replace('%',''))
-                          port = r[-1]
-                      except:
-                          continue
+          with open("all_results.csv") as f:
+              reader = csv.DictReader(f)
+              for r in reader:
+                  try:
+                      ip = r['IP 地址']
+                      port = r['端口']
+                      delay = float(r['平均延迟'])
+                      loss = float(r['丢包率'].replace('%',''))
+                  except:
+                      continue
 
-                      if loss > MAX_LOSS:
-                          continue
+                  if loss > MAX_LOSS:
+                      continue
 
-                      key = f"{ip}:{port}"
-
-                      if key not in merged:
-                          merged[key] = []
-
-                      merged[key].append(delay*(1+loss/100))
-
-          # 读取所有区域
-          for root,_,files in os.walk("data"):
-              for f in files:
-                  if f.endswith(".csv"):
-                      load(os.path.join(root,f))
-
-          final = []
-          for k,v in merged.items():
-              score = sum(v)/len(v)   # 多地区平均
-              final.append((k,score))
-
-          final.sort(key=lambda x:x[1])
-
-          with open("best_ip.txt","w") as f:
-              for ip,score in final[:FINAL]:
-                  f.write(ip+"\n")
-
-          print("最终数量:",len(final[:FINAL]))
-          EOF
-
-      - name: Commit
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@github.com"
-          git add best_ip.txt
-          git commit -m "update multi-region ip" || echo "no change"
-          git push
+                  score = delay * (1 + loss
