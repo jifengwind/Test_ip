@@ -13,14 +13,14 @@ on:
 
 env:
   # -------------------- 抽样与扫描配置 --------------------
-  SAMPLE_SIZE: 1000000                # 从百万级 IP 池中随机抽取多少个 IP 进行扫描
-  OUTPUT_N: 200000                    # CloudflareST 输出的候选 IP 数量
-  MAX_LATENCY: 400                 # 延迟上限(ms)，超过此值的 IP 直接丢弃
+  SAMPLE_SIZE: 8000000                # 从百万级 IP 池中随机抽取多少个 IP 进行扫描
+  OUTPUT_N: 100000                    # CloudflareST 输出的候选 IP 数量
+  MAX_LATENCY: 1000                 # 延迟上限(ms)，超过此值的 IP 直接丢弃
   THREADS: 60                      # 并发线程数，越高扫描越快（建议 16-64）
   
   # -------------------- 结果筛选配置 --------------------
   FINAL_OUTPUT: 2000                 # 最终保存到文件的最优 IP 数量
-  MAX_LOSS: 5                     # 最大丢包率(%)，超过此值的 IP 丢弃
+  MAX_LOSS: 10                     # 最大丢包率(%)，超过此值的 IP 丢弃
   
   # -------------------- 输出端口配置 --------------------
   DEFAULT_PORT: 443                # 输出 IP 时使用的端口号
@@ -123,7 +123,9 @@ jobs:
             -t ${{ env.THREADS }} \
             -tl ${{ env.MAX_LATENCY }} \
             -httping \
-            -dd
+            -dd \
+            -sl 15 \
+            
           
           if [ ! -f result.csv ]; then
             echo "❌ 未生成结果文件"
