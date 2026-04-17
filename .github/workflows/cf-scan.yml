@@ -176,7 +176,7 @@ jobs:
               -n ${{ env.THREADS_PER_PROCESS }} \
               -t ${{ env.PING_COUNT }} \
               -httping \
-              -url https://speed.cloudflare.com/__down?bytes=0 \
+              -url https://www.cloudflare.com/favicon.ico
               -tl ${{ env.MAX_LATENCY }} \
               -tlr ${{ env.MAX_LOSS_RATE }} \
               -tp ${{ env.PORTS }} \
