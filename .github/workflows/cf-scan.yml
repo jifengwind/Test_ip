@@ -7,6 +7,8 @@
 #   ✅ 延迟上限放宽至 800ms
 #   ✅ 丢包率上限放宽至 30%
 #   ✅ 增加种子库验证和单 IP 调试
+#   ✅ 超时时间 60 分钟
+#   ✅ 智能提交带冲突解决
 # =============================================================================
 
 name: CF IP Extreme Scan TCP Stable
@@ -14,7 +16,7 @@ name: CF IP Extreme Scan TCP Stable
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 1 * *'
+    - cron: '0 18 * * *'
 
 env:
   # -------------------- 保底修正配置 --------------------
@@ -32,7 +34,7 @@ env:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 60             # 超时时间设置为 60 分钟
 
     steps:
       - name: Checkout Code
@@ -262,7 +264,7 @@ jobs:
                   f.write(f"{ip}\n")
           
           with open('Test_ip/ips_443.txt', 'w') as f:
-              for ip in ip_list[:5000]:
+              for ip in ip_list[:10000]:
                   f.write(f"{ip}\n")
 
           print(f"✅ 文件已保存到 Test_ip/")
@@ -282,8 +284,8 @@ jobs:
           echo ""
           
           if [ ${TOTAL} -gt 0 ]; then
-            echo "前20个可用 IP:"
-            head -20 Test_ip/available_ips.txt
+            echo "前30个可用 IP:"
+            head -30 Test_ip/available_ips.txt
           else
             echo "⚠️ 无可用 IP"
           fi
@@ -292,7 +294,7 @@ jobs:
           ls -lh Test_ip/
 
       # ===============================
-      # 智能提交
+      # 智能提交 (带冲突解决)
       # ===============================
       - name: Smart Commit
         run: |
@@ -303,11 +305,16 @@ jobs:
             if [ "$NEW_HASH" != "$OLD_HASH" ]; then
               git config --local user.email "action@github.com"
               git config --local user.name "GitHub Action"
+              
+              # 拉取远程更新
+              echo "拉取远程更新..."
+              git pull --rebase origin main 2>/dev/null || git pull origin main 2>/dev/null || echo "无远程更新或拉取失败，继续..."
+              
               git add Test_ip/ -f
               
               TOTAL=$(wc -l < Test_ip/available_ips.txt)
               
-              git commit -m "🔄 CF可用IP [$(date +'%m-%d')] - ${TOTAL}个" || exit 0
+              git commit -m "🔄 CF可用IP [$(date +'%m-%d %H:%M')] - ${TOTAL}个" || exit 0
               git push
               echo "✅ 已推送"
             else
@@ -333,7 +340,7 @@ jobs:
       # ===============================
       - name: Cleanup
         if: always()
-        run: rm -f all_ips.txt CloudflareST ip_part_* *.csv
+        run: rm -f all_ips.txt CloudflareST ip_part_* *.csv test_ip.txt
 
       # ===============================
       # GitHub Summary
@@ -343,12 +350,12 @@ jobs:
           TOTAL=$(wc -l < Test_ip/available_ips.txt 2>/dev/null || echo 0)
           
           {
-            echo "## 🚀 CF IP TCP模式扫描结果 (保底修正版)"
+            echo "## 🚀 CF IP TCP模式扫描结果"
             echo ""
             echo "| 项目 | 值 |"
             echo "|------|-----|"
             echo "| 扫描时间 | $(date +'%Y-%m-%d %H:%M') |"
-            echo "| 扫描端口 | 443 (仅) |"
+            echo "| 扫描端口 | 443 |"
             echo "| 总并发 | $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }})) |"
             echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |"
             echo "| 丢包上限 | ${{ env.MAX_LOSS_RATE }} |"
@@ -358,12 +365,13 @@ jobs:
             if [ ${TOTAL} -gt 0 ]; then
               echo "### 📋 深圳本地验证命令"
               echo '```bash'
+              echo '# 下载 ips_443.txt 后运行'
               echo './CloudflareST -f ips_443.txt -n 200 -t 4 -dn 20 -o local.csv'
               echo '```'
               echo ""
               echo "### 🎯 可用IP示例"
               echo '```'
-              head -15 Test_ip/available_ips.txt 2>/dev/null
+              head -20 Test_ip/available_ips.txt 2>/dev/null
               echo '```'
             else
               echo "### ⚠️ 扫描结果为 0"
