@@ -74,20 +74,40 @@ jobs:
         uses: actions/cache@v4
         with:
           path: CloudflareST
-          key: cloudflarest-v2.2.5
+          key: cloudflarest-v2.3.4
 
-       - name: Download CloudflareST
+      # ===============================
+      # 下载 CloudflareST (修正版)
+      # ===============================
+      - name: Download CloudflareST
         run: |
-          if [ ! -f cfst ]; then
+          if [ ! -f CloudflareST ]; then
             echo "=== 下载 CloudflareSpeedTest v2.3.4 ==="
             wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
             tar -xzf cfst_linux_amd64.tar.gz
-            chmod +x cfst
+            
+            # v2.3.4 解压后的可执行文件名为 cfst，需要重命名为 CloudflareST 以保持兼容
+            if [ -f cfst ]; then
+              mv cfst CloudflareST
+              chmod +x CloudflareST
+              echo "✅ 下载完成并重命名为 CloudflareST"
+            elif [ -f CloudflareST ]; then
+              chmod +x CloudflareST
+              echo "✅ 下载完成"
+            else
+              echo "❌ 错误：找不到可执行文件"
+              ls -la
+              exit 1
+            fi
+            
             rm cfst_linux_amd64.tar.gz
-            echo "✅ 下载完成"
           else
-            echo "✅ 使用已存在的 cfst"
+            echo "✅ 使用缓存的 CloudflareST"
           fi
+          
+          # 验证可执行文件
+          echo "验证 CloudflareST："
+          ./CloudflareST -v 2>&1 || echo "版本信息获取失败，但文件存在"
 
       # ===============================
       # 准备 CIDR 列表
@@ -203,7 +223,7 @@ jobs:
             
             while [ $retry -lt $max_retry ]; do
               # 执行测试
-              ./cfst \
+              ./CloudflareST \
                 -f all_ips.txt \
                 -n ${{ env.OUTPUT_N }} \
                 -t '$THREADS_PER_PORT' \
