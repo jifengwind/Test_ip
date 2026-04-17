@@ -1,12 +1,13 @@
 # =============================================================================
-# CF IP 极致扫描版 - 最终融合版
+# CF IP 极致扫描版 - 最终融合版 (抗限流优化)
 # =============================================================================
 # 融合优势：
-#   ✅ 社区优质段 (Pro 的杀手锏) + 本地 ipv4cidr.txt
+#   ✅ 本地 ipv4cidr.txt + 社区优质段 + 官方段
 #   ✅ 动态列解析 (v3 的健壮性)
 #   ✅ 3×100 并发 (Pro 的精准控制)
-#   ✅ 443 纯IP输出 (v3 的实用性)
-#   ✅ 精简输出 + 详细摘要
+#   ✅ 使用 speed.cloudflare.com/__down?bytes=0 抗限流
+#   ✅ 自动降级到 TCP 模式
+#   ✅ 443 纯IP输出
 # =============================================================================
 
 name: CF IP Extreme Scan Fusion
@@ -93,7 +94,6 @@ jobs:
           echo "   vfarid: $(wc -l < source1.txt 2>/dev/null || echo 0)"
           echo "   IPDB: $(wc -l < source2.txt 2>/dev/null || echo 0)"
           
-          # 清理临时文件
           rm -f local.txt official.txt source1.txt source2.txt
 
       # ===============================
@@ -154,7 +154,7 @@ jobs:
           done
 
       # ===============================
-      # 多进程并行扫描
+      # 多进程并行扫描 (抗限流优化版)
       # ===============================
       - name: Parallel Scan
         run: |
@@ -163,30 +163,51 @@ jobs:
           echo "总并发: $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }}))"
           echo "延迟上限: ${{ env.MAX_LATENCY }}ms"
           echo "端口: ${{ env.PORTS }}"
+          echo "测试地址: https://speed.cloudflare.com/__down?bytes=0"
           echo ""
           
           parallel -j ${{ env.PROCESSES }} '
             part={}
             echo "[进程 {}] 开始扫描 $(wc -l < $part) 个IP..."
             
+            # 使用 speed.cloudflare.com 的测速文件，避免触发 DDoS 防护
             ./CloudflareST \
               -f $part \
               -n ${{ env.THREADS_PER_PROCESS }} \
               -t ${{ env.PING_COUNT }} \
               -httping \
-              -url https://cloudflare.com/cdn-cgi/trace \
+              -url https://speed.cloudflare.com/__down?bytes=0 \
               -tl ${{ env.MAX_LATENCY }} \
               -tlr ${{ env.MAX_LOSS_RATE }} \
               -tp ${{ env.PORTS }} \
               -dd \
               -p ${{ env.OUTPUT_PER_PROCESS }} \
-              -o result_{}.csv 2>&1 | grep -E "可用:|有效IP|测速完成" || true
+              -o result_{}.csv 2>&1 | tail -5
             
             if [ -f result_{}.csv ] && [ $(wc -l < result_{}.csv) -gt 1 ]; then
               count=$(($(wc -l < result_{}.csv) - 1))
               echo "[进程 {}] ✅ 发现 $count 个可用组合"
             else
-              echo "[进程 {}] ⚠️ 无结果"
+              echo "[进程 {}] ⚠️ HTTPing 无结果，降级到 TCP 模式..."
+              
+              # 降级：移除 -httping，使用 TCP 模式
+              ./CloudflareST \
+                -f $part \
+                -n 50 \
+                -t 1 \
+                -tl 500 \
+                -tlr ${{ env.MAX_LOSS_RATE }} \
+                -tp ${{ env.PORTS }} \
+                -dd \
+                -p ${{ env.OUTPUT_PER_PROCESS }} \
+                -o result_{}.csv 2>&1 | tail -3
+              
+              if [ -f result_{}.csv ] && [ $(wc -l < result_{}.csv) -gt 1 ]; then
+                count=$(($(wc -l < result_{}.csv) - 1))
+                echo "[进程 {}] ✅ TCP模式发现 $count 个可用组合"
+              else
+                echo "[进程 {}] ❌ 无结果"
+              fi
             fi
           ' ::: ip_part_*
 
@@ -213,7 +234,6 @@ jobs:
                       reader = csv.reader(fp)
                       header = next(reader, None)
                       
-                      # 动态查找列索引 (v3 的健壮性)
                       ip_idx = 0
                       port_idx = None
                       if header:
@@ -359,6 +379,7 @@ jobs:
             echo "| 种子段 | 本地+官方+vfarid+IPDB |"
             echo "| 采样数 | ${{ env.SAMPLE_SIZE }} |"
             echo "| 总并发 | $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }})) |"
+            echo "| 测试地址 | speed.cloudflare.com/__down?bytes=0 |"
             echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |"
             echo "| **可用组合** | **${TOTAL_COMBOS}** |"
             echo "| **唯一IP** | **${TOTAL_IPS}** |"
