@@ -14,7 +14,7 @@ name: CF IP Extreme Scan TCP Stable
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 1 * *'
 
 env:
   # -------------------- 保底修正配置 --------------------
@@ -32,7 +32,7 @@ env:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Code
