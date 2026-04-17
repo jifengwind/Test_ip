@@ -1,30 +1,185 @@
-# ==============================
-# 高优先级（强烈推荐）
-# ==============================
-104.16.0.0/13
-104.24.0.0/14
-172.64.0.0/13
-162.159.0.0/16
+name: CF IP Auto Select (Optimized Lite)
 
-# ==============================
-# 次优（补充池）
-# ==============================
-104.18.0.0/15
-104.20.0.0/14
-104.22.0.0/15
-104.23.0.0/16
-104.25.0.0/16
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * *'
 
-# ==============================
-# 较稳定补充
-# ==============================
-172.66.0.0/15
-172.67.0.0/16
+env:
+  SAMPLE_SIZE: 200000
+  OUTPUT_N: 5000
+  THREADS: 80
+  MAX_LATENCY: 500
+  FINAL_OUTPUT: 1500
+  MAX_LOSS: 5
 
-# ==============================
-# 小众但偶尔出好IP
-# ==============================
-188.114.96.0/20
-190.93.240.0/20
-197.234.240.0/22
-198.41.128.0/17
+  PORTS: "443 8443 2053 2083 2087"
+  DEFAULT_PORT: 443
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: mkdir -p Test_ip
+
+      # 下载 CFST
+      - name: Download CloudflareST
+        run: |
+          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+          tar -xzf CloudflareST_linux_amd64.tar.gz
+          chmod +x CloudflareST
+
+      # CIDR
+      - name: Prepare CIDR
+        run: |
+          if [ -s ipv4cidr.txt ]; then
+            echo "使用本地CIDR"
+            cp ipv4cidr.txt all_cidr.txt
+          else
+            echo "使用官方CIDR"
+            curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
+          fi
+
+      # 抽样（优化版）
+      - name: Sample IPs
+        run: |
+          python3 << 'EOF'
+          import ipaddress, random, os
+
+          SAMPLE_SIZE = int(os.environ['SAMPLE_SIZE'])
+          MAX_PER_CIDR = 500
+
+          cidrs = []
+          for line in open('all_cidr.txt'):
+              try:
+                  net = ipaddress.ip_network(line.strip(), False)
+                  if net.num_addresses > 10:
+                      cidrs.append(net)
+              except:
+                  pass
+
+          sample_ips = set()
+
+          for net in cidrs:
+              count = min(MAX_PER_CIDR, net.num_addresses - 2)
+              for _ in range(count):
+                  ip = net[random.randint(1, net.num_addresses - 2)]
+                  sample_ips.add(str(ip))
+                  if len(sample_ips) >= SAMPLE_SIZE:
+                      break
+              if len(sample_ips) >= SAMPLE_SIZE:
+                  break
+
+          open('all_ips.txt','w').write('\n'.join(sample_ips))
+          print("抽样完成:", len(sample_ips))
+          EOF
+
+      # 多端口测速
+      - name: Multi-Port Test
+        run: |
+          > all_results.csv
+
+          for port in ${{ env.PORTS }}
+          do
+            echo "测试端口 $port"
+
+            ./CloudflareST \
+              -f all_ips.txt \
+              -n ${{ env.OUTPUT_N }} \
+              -t ${{ env.THREADS }} \
+              -tl ${{ env.MAX_LATENCY }} \
+              -httping \
+              -dd \
+              -sl 8 \
+              -p $port
+
+            if [ -f result.csv ]; then
+              if [ ! -s all_results.csv ]; then
+                head -1 result.csv | sed 's/$/,端口/' > all_results.csv
+              fi
+              tail -n +2 result.csv | awk -v p="$port" '{print $0 "," p}' >> all_results.csv
+            fi
+          done
+
+      # 结果处理（强化版）
+      - name: Process Results
+        run: |
+          python3 << 'EOF'
+          import csv, os
+          from collections import defaultdict
+
+          FINAL_OUTPUT = int(os.environ['FINAL_OUTPUT'])
+          MAX_LOSS = float(os.environ['MAX_LOSS'])
+
+          PORT_PRIORITY = {
+              "443": 1.0,
+              "8443": 0.97,
+              "2053": 0.93,
+              "2083": 0.90,
+              "2087": 0.88
+          }
+
+          ip_map = defaultdict(dict)
+
+          with open('all_results.csv','r',encoding='utf-8') as f:
+              for r in csv.DictReader(f):
+                  try:
+                      ip = r['IP 地址']
+                      delay = float(r['平均延迟'])
+                      loss = float(r['丢包率'].rstrip('%'))
+
+                      if loss > MAX_LOSS or delay <= 0:
+                          continue
+
+                      port = r.get('端口') or r.get('测试端口')
+
+                      score = delay * (1 + (loss/10)**2)
+                      score /= PORT_PRIORITY.get(port,0.8)
+
+                      ip_map[ip][port] = (score, delay, loss)
+                  except:
+                      pass
+
+          results = []
+
+          for ip, ports in ip_map.items():
+              best = min(ports.items(), key=lambda x: x[1][0])
+              port = best[0]
+              score, delay, loss = best[1]
+
+              results.append((ip, port, delay, loss, score))
+
+          results.sort(key=lambda x: x[4])
+          results = results[:FINAL_OUTPUT]
+
+          os.makedirs('Test_ip', exist_ok=True)
+
+          with open('Test_ip/result_IP.txt','w') as f:
+              for ip, port, *_ in results:
+                  f.write(f"{ip}:{port}\n")
+
+          print("完成:", len(results))
+          EOF
+
+      # 提交
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "action@github.com"
+
+          git add Test_ip/ -f
+
+          if git diff --cached --quiet; then
+            echo "无更新"
+          else
+            git commit -m "update cf ip"
+            git push
+          fi
