@@ -79,14 +79,15 @@ jobs:
       - name: Download CloudflareST
         run: |
           if [ ! -f CloudflareST ]; then
-            echo "=== 下载 CloudflareSpeedTest ==="
-            wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_arm64.tar.gz
-            tar -xzf cfst_linux_arm64.tar.gz
+            echo "=== 下载 CloudflareSpeedTest v2.3.4 ==="
+            # 使用您提供的新版本链接
+            wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_linux_amd64.tar.gz
+            tar -xzf cfst_linux_amd64.tar.gz
             chmod +x CloudflareST
-            rm CloudflareST_linux_amd64.tar.gz
+            rm cfst_linux_amd64.tar.gz
             echo "✅ 下载完成"
           else
-            echo "✅ 使用缓存的 CloudflareST"
+            echo "✅ 使用已存在的 CloudflareST"
           fi
 
       # ===============================
