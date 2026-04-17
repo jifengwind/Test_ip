@@ -1,17 +1,15 @@
 # =============================================================================
-# CF IP Auto Select - 参数修正版 (禁用下载测速)
+# CF IP Auto Select - HTTPing + TCP 混合版
 # =============================================================================
-# 修正内容：
-#   ✅ -n 参数：延迟测速线程数（非输出数量）
-#   ✅ -tp 参数：指定测速端口（非超时时间）
-#   ✅ -t 参数：延迟测速次数（每个IP测4次）
-#   ✅ -tlr 参数：丢包率上限（替代错误的 -sl）
-#   ✅ -dd 参数：禁用下载测速（只按延迟排序）
-#   ✅ -p 参数：显示/输出结果数量
-#   ✅ 自动诊断：失败时启用 -debug 模式
+# 特性：
+#   ✅ HTTPing + TCP 双模式测试
+#   ✅ 禁用下载测速 (-dd)
+#   ✅ 移除运营商识别
+#   ✅ 精简输出文件
+#   ✅ 自动诊断
 # =============================================================================
 
-name: CF IP Auto Select (No Download Test)
+name: CF IP Auto Select (HTTPing + TCP)
 
 on:
   workflow_dispatch:
@@ -23,8 +21,8 @@ env:
   SAMPLE_SIZE: 100000               # 从 CIDR 中随机抽取的 IP 数量
   
   # -------------------- 延迟测速配置 --------------------
-  THREADS: 200                      # 延迟测速线程数 (默认200)
-  PING_COUNT: 4                     # 每个IP延迟测速次数 (默认4)
+  THREADS: 200                      # 延迟测速线程数
+  PING_COUNT: 4                     # 每个IP延迟测速次数
   MAX_LATENCY: 400                  # 平均延迟上限(ms)
   MAX_LOSS_RATE: 0.05               # 丢包率上限 (0.05 = 5%)
   
@@ -38,7 +36,7 @@ env:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25              # 禁用下载测速后更快
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Code
@@ -59,7 +57,7 @@ jobs:
         run: mkdir -p Test_ip
 
       # ===============================
-      # 下载 CloudflareST (含调试信息)
+      # 下载 CloudflareST
       # ===============================
       - name: Download CloudflareST
         run: |
@@ -80,17 +78,10 @@ jobs:
           
           echo ""
           echo "=========================================="
-          echo "📋 本次测试将使用的参数 (禁用下载测速)"
+          echo "📋 测试参数说明"
           echo "=========================================="
-          echo "  -f all_ips.txt          # IP列表文件"
-          echo "  -n ${{ env.THREADS }}    # 延迟测速线程数"
-          echo "  -t ${{ env.PING_COUNT }}  # 每个IP延迟测速次数"
-          echo "  -tl ${{ env.MAX_LATENCY }} # 平均延迟上限(ms)"
-          echo "  -tlr ${{ env.MAX_LOSS_RATE }} # 丢包率上限"
-          echo "  -dd                     # 禁用下载测速"
-          echo "  -p ${{ env.OUTPUT_COUNT }} # 输出结果数量"
-          echo "  -tp [端口]               # 测试端口"
-          echo "  -o result_[端口].csv     # 输出文件"
+          echo "  模式1 (TCP):  -f all_ips.txt -n ${{ env.THREADS }} -t ${{ env.PING_COUNT }} -tl ${{ env.MAX_LATENCY }} -tlr ${{ env.MAX_LOSS_RATE }} -tp [端口] -dd -p ${{ env.OUTPUT_COUNT }}"
+          echo "  模式2 (HTTP): -f all_ips.txt -n ${{ env.THREADS }} -t ${{ env.PING_COUNT }} -tl ${{ env.MAX_LATENCY }} -tlr ${{ env.MAX_LOSS_RATE }} -tp [端口] -httping -dd -p ${{ env.OUTPUT_COUNT }}"
           echo ""
 
       # ===============================
@@ -100,7 +91,6 @@ jobs:
         run: |
           echo "=== 准备 CIDR 并抽样 ==="
           
-          # 获取 CIDR
           if [ -f ipv4cidr.txt ]; then
             cp ipv4cidr.txt all_cidr.txt
             echo "✅ 使用本地 ipv4cidr.txt"
@@ -111,7 +101,6 @@ jobs:
           
           echo "CIDR 段数: $(wc -l < all_cidr.txt)"
           
-          # 极速抽样
           python3 << 'EOF' > all_ips_raw.txt
           import ipaddress
 
@@ -138,32 +127,18 @@ jobs:
           rm all_ips_raw.txt all_cidr.txt
 
       # ===============================
-      # 多端口并行测试 (禁用下载测速版)
+      # TCP 模式测试
       # ===============================
-      - name: Multi-Port Parallel Test
+      - name: TCP Mode Test
         run: |
-          echo "=== 并行测试端口: ${{ env.PORTS }} ==="
+          echo "=== TCP 模式测试 ==="
           
-          PORT_COUNT=$(echo "${{ env.PORTS }}" | wc -w)
-          
-          echo "端口数: $PORT_COUNT"
-          echo "延迟测速线程(-n): ${{ env.THREADS }}"
-          echo "每IP测速次数(-t): ${{ env.PING_COUNT }}"
-          echo "延迟上限(-tl): ${{ env.MAX_LATENCY }}ms"
-          echo "丢包率上限(-tlr): ${{ env.MAX_LOSS_RATE }}"
-          echo "输出数量(-p): ${{ env.OUTPUT_COUNT }}"
-          echo "下载测速: 已禁用(-dd)"
-          echo ""
-          
-          # 并行执行
-          echo "${{ env.PORTS }}" | tr ' ' '\n' | parallel -j $PORT_COUNT '
-            port={}
+          for port in ${{ env.PORTS }}; do
+            echo ""
             echo "=========================================="
-            echo "[端口 $port] 开始测试..."
-            echo "[端口 $port] 命令: ./CloudflareST -f all_ips.txt -n ${{ env.THREADS }} -t ${{ env.PING_COUNT }} -tl ${{ env.MAX_LATENCY }} -tlr ${{ env.MAX_LOSS_RATE }} -tp $port -dd -p ${{ env.OUTPUT_COUNT }} -o result_$port.csv"
+            echo "[TCP 模式] 测试端口: $port"
             echo "=========================================="
             
-            # 执行测试 (禁用下载测速)
             ./CloudflareST \
               -f all_ips.txt \
               -n ${{ env.THREADS }} \
@@ -173,67 +148,125 @@ jobs:
               -tp $port \
               -dd \
               -p ${{ env.OUTPUT_COUNT }} \
-              -o result_$port.csv 2>&1 | tail -40
+              -o tcp_result_$port.csv 2>&1 | tail -30
             
-            if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < result_$port.csv) - 1))
-              echo ""
-              echo "[端口 $port] ✅ 完成，获得 $count 个IP"
-              echo "[端口 $port] 前5个结果预览:"
-              head -6 result_$port.csv | column -t -s,
+            if [ -f tcp_result_$port.csv ] && [ $(wc -l < tcp_result_$port.csv) -gt 1 ]; then
+              count=$(($(wc -l < tcp_result_$port.csv) - 1))
+              echo "[TCP:$port] ✅ 获得 $count 个IP"
             else
-              echo ""
-              echo "[端口 $port] ❌ 无有效结果，启用调试模式重新测试..."
-              
-              # 调试模式
-              ./CloudflareST \
-                -f all_ips.txt \
-                -n 50 \
-                -t 2 \
-                -tl 800 \
-                -tp $port \
-                -dd \
-                -p 20 \
-                -debug \
-                -o debug_$port.csv 2>&1 | tail -50
-              
-              if [ -f debug_$port.csv ] && [ $(wc -l < debug_$port.csv) -gt 1 ]; then
-                count=$(($(wc -l < debug_$port.csv) - 1))
-                echo "[端口 $port] 调试模式获得 $count 个IP"
-                mv debug_$port.csv result_$port.csv
-              fi
+              echo "[TCP:$port] ⚠️ 无结果"
             fi
-            echo ""
-          '
-          
-          # 合并结果
+          done
+
+      # ===============================
+      # HTTPing 模式测试
+      # ===============================
+      - name: HTTPing Mode Test
+        run: |
           echo ""
-          echo "=== 合并测试结果 ==="
+          echo "=== HTTPing 模式测试 ==="
+          
+          for port in ${{ env.PORTS }}; do
+            echo ""
+            echo "=========================================="
+            echo "[HTTPing 模式] 测试端口: $port"
+            echo "=========================================="
+            
+            ./CloudflareST \
+              -f all_ips.txt \
+              -n ${{ env.THREADS }} \
+              -t ${{ env.PING_COUNT }} \
+              -tl ${{ env.MAX_LATENCY }} \
+              -tlr ${{ env.MAX_LOSS_RATE }} \
+              -tp $port \
+              -httping \
+              -dd \
+              -p ${{ env.OUTPUT_COUNT }} \
+              -o http_result_$port.csv 2>&1 | tail -30
+            
+            if [ -f http_result_$port.csv ] && [ $(wc -l < http_result_$port.csv) -gt 1 ]; then
+              count=$(($(wc -l < http_result_$port.csv) - 1))
+              echo "[HTTP:$port] ✅ 获得 $count 个IP"
+            else
+              echo "[HTTP:$port] ⚠️ 无结果"
+            fi
+          done
+
+      # ===============================
+      # 合并所有结果
+      # ===============================
+      - name: Merge All Results
+        run: |
+          echo ""
+          echo "=== 合并 TCP + HTTPing 结果 ==="
+          
           > all_results.csv
           FIRST=true
           TOTAL=0
           
+          # 合并 TCP 结果
           for port in ${{ env.PORTS }}; do
-            if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
-              count=$(($(wc -l < result_$port.csv) - 1))
-              echo "端口 $port: $count 条"
+            if [ -f tcp_result_$port.csv ] && [ $(wc -l < tcp_result_$port.csv) -gt 1 ]; then
+              count=$(($(wc -l < tcp_result_$port.csv) - 1))
+              echo "TCP:$port -> $count 条"
               TOTAL=$((TOTAL + count))
               
               if [ "$FIRST" = true ]; then
-                head -1 result_$port.csv | sed 's/$/,测试端口/' > all_results.csv
+                head -1 tcp_result_$port.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
                 FIRST=false
               fi
-              tail -n +2 result_$port.csv | awk -v p="$port" '{print $0 "," p}' >> all_results.csv
-              rm result_$port.csv
+              tail -n +2 tcp_result_$port.csv | awk -v m="TCP" -v p="$port" '{print $0 "," m "," p}' >> all_results.csv
+              rm tcp_result_$port.csv
+            fi
+          done
+          
+          # 合并 HTTPing 结果
+          for port in ${{ env.PORTS }}; do
+            if [ -f http_result_$port.csv ] && [ $(wc -l < http_result_$port.csv) -gt 1 ]; then
+              count=$(($(wc -l < http_result_$port.csv) - 1))
+              echo "HTTP:$port -> $count 条"
+              TOTAL=$((TOTAL + count))
+              
+              if [ "$FIRST" = true ]; then
+                head -1 http_result_$port.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
+                FIRST=false
+              fi
+              tail -n +2 http_result_$port.csv | awk -v m="HTTP" -v p="$port" '{print $0 "," m "," p}' >> all_results.csv
+              rm http_result_$port.csv
             fi
           done
           
           echo ""
-          echo "总测试结果: $TOTAL 条"
+          echo "总结果数: $TOTAL 条"
           
           if [ $TOTAL -le 0 ]; then
-            echo "❌ 无有效结果"
-            exit 1
+            echo "❌ 无有效结果，尝试调试模式..."
+            
+            # 调试模式
+            echo ""
+            echo "=== 调试模式测试 (端口443) ==="
+            ./CloudflareST \
+              -f all_ips.txt \
+              -n 50 \
+              -t 2 \
+              -tl 800 \
+              -tp 443 \
+              -httping \
+              -dd \
+              -p 50 \
+              -debug \
+              -o debug_result.csv 2>&1 | tail -50
+            
+            if [ -f debug_result.csv ] && [ $(wc -l < debug_result.csv) -gt 1 ]; then
+              count=$(($(wc -l < debug_result.csv) - 1))
+              echo "调试模式获得 $count 个IP"
+              head -1 debug_result.csv | sed 's/$/,测试模式,测试端口/' > all_results.csv
+              tail -n +2 debug_result.csv | awk -v m="DEBUG" -v p="443" '{print $0 "," m "," p}' >> all_results.csv
+              TOTAL=$count
+            else
+              echo "❌ 调试模式也无结果"
+              exit 1
+            fi
           fi
           
           echo ""
@@ -241,13 +274,12 @@ jobs:
           head -11 all_results.csv | column -t -s,
 
       # ===============================
-      # 智能筛选 (精简版 - 仅按延迟排序)
+      # 智能筛选 (无运营商)
       # ===============================
       - name: Smart Filter
         run: |
-          echo "=== 智能筛选 (按延迟排序) ==="
-          echo "配置: 最终输出=${{ env.OUTPUT_COUNT }} | 延迟上限=${{ env.MAX_LATENCY }}ms"
           echo ""
+          echo "=== 智能筛选 (按延迟排序) ==="
           
           python3 << 'EOF'
           import csv
@@ -257,46 +289,11 @@ jobs:
           FINAL_OUTPUT = int(os.environ.get('OUTPUT_COUNT', 1500))
           DEFAULT_PORT = os.environ.get('DEFAULT_PORT', '443')
           
-          # ===============================
-          # 运营商识别
-          # ===============================
-          def detect_isp(ip):
-              parts = ip.split('.')
-              if len(parts) != 4:
-                  return '多线'
-              first, second = parts[0], parts[1]
-              
-              # 移动
-              if first == '104' and second in ('16','17','18','19','28','29'):
-                  return '移动'
-              if first == '162' and second == '159':
-                  return '移动'
-              if first == '172' and second in ('64','65','66','67','68'):
-                  return '移动'
-              
-              # 联通
-              if first == '104' and second in ('20','21','22','23','24','31'):
-                  return '联通'
-              if first == '162' and second == '158':
-                  return '联通'
-              
-              # 电信
-              if first == '104' and second in ('25','26','27','30'):
-                  return '电信'
-              if first == '162' and second in ('159','160'):
-                  return '电信'
-              if first == '172' and second in ('69','70'):
-                  return '电信'
-              
-              return '多线'
-          
-          # ===============================
-          # 读取数据
-          # ===============================
           if not os.path.exists('all_results.csv'):
               print("❌ 无结果文件")
               exit(1)
           
+          # 按 IP 聚合，找出每个 IP 的最佳结果
           ip_data = defaultdict(list)
           
           with open('all_results.csv', 'r', encoding='utf-8') as f:
@@ -311,100 +308,102 @@ jobs:
                       loss_str = row.get('丢包率', '100').strip().rstrip('%')
                       loss = float(loss_str) if loss_str else 100
                       port = row.get('测试端口', '').strip()
+                      mode = row.get('测试模式', '').strip()
                       
                       if delay > 0:
                           # 得分 = 延迟 + 丢包惩罚
-                          score = delay * (1 + loss / 100)
-                          ip_data[ip].append((port, delay, loss, score))
+                          # HTTPing 模式加权 (通常更准确)
+                          mode_weight = 0.95 if mode == 'HTTP' else 1.0
+                          score = delay * (1 + loss / 100) * mode_weight
+                          ip_data[ip].append((port, mode, delay, loss, score))
                   except:
                       continue
           
           print(f"有效 IP 数: {len(ip_data)}")
           
-          # ===============================
           # 筛选最佳
-          # ===============================
           results = []
-          for ip, ports in ip_data.items():
-              ports.sort(key=lambda x: x[3])  # 按得分排序
-              best = ports[0]
-              isp = detect_isp(ip)
+          for ip, records in ip_data.items():
+              records.sort(key=lambda x: x[4])  # 按得分排序
+              best = records[0]
               
               results.append({
                   'ip': ip,
                   'port': best[0],
-                  'delay': best[1],
-                  'loss': best[2],
-                  'score': best[3],
-                  'isp': isp,
-                  'all_ports': [p[0] for p in ports]
+                  'mode': best[1],
+                  'delay': best[2],
+                  'loss': best[3],
+                  'score': best[4]
               })
           
-          # 按得分排序 (延迟越低越好)
+          # 按得分排序
           results.sort(key=lambda x: x['score'])
           top = results[:FINAL_OUTPUT]
           
           print(f"最终选出: {len(top)} 个IP")
           print("")
           
-          # ===============================
           # 统计
-          # ===============================
-          stats = {'移动':0, '联通':0, '电信':0, '多线':0}
           port_stats = defaultdict(int)
+          mode_stats = defaultdict(int)
           for r in top:
-              stats[r['isp']] += 1
               port_stats[r['port']] += 1
+              mode_stats[r['mode']] += 1
           
-          print("=== 运营商分布 ===")
-          for k, v in stats.items():
-              if v > 0:
-                  avg_delay = sum(r['delay'] for r in top if r['isp'] == k) / v
-                  print(f"  {k}: {v} ({v*100/len(top):.1f}%) 平均延迟: {avg_delay:.1f}ms")
+          print("=== 测试模式分布 ===")
+          for mode, count in sorted(mode_stats.items(), key=lambda x: -x[1]):
+              print(f"  {mode}: {count} ({count*100/len(top):.1f}%)")
           
           print("")
           print("=== 端口分布 ===")
           for port, count in sorted(port_stats.items(), key=lambda x: -x[1]):
-              print(f"  端口 {port}: {count} ({count*100/len(top):.1f}%)")
+              print(f"  {port}: {count} ({count*100/len(top):.1f}%)")
           
           print("")
-          print("=== 前15个优选IP ===")
-          for i, r in enumerate(top[:15], 1):
-              print(f"  {i:2}. {r['ip']}:{r['port']} [{r['isp']}] 延迟:{r['delay']:.1f}ms 丢包:{r['loss']:.1f}%")
+          print("=== 延迟统计 ===")
+          delays = [r['delay'] for r in top]
+          print(f"  最低: {min(delays):.1f}ms")
+          print(f"  最高: {max(delays):.1f}ms")
+          print(f"  平均: {sum(delays)/len(delays):.1f}ms")
+          
+          print("")
+          print("=== 前20个优选IP ===")
+          for i, r in enumerate(top[:20], 1):
+              print(f"  {i:2}. {r['ip']}:{r['port']} [{r['mode']}] 延迟:{r['delay']:.1f}ms 丢包:{r['loss']:.1f}%")
           
           # ===============================
-          # 保存文件
+          # 保存文件 (精简版)
           # ===============================
           
-          # 1. 主文件: IP:端口#运营商
+          # 1. 主文件: IP:端口
           with open('Test_ip/result_IP.txt', 'w') as f:
               for r in top:
-                  f.write(f"{r['ip']}:{r['port']}#{r['isp']}\n")
+                  f.write(f"{r['ip']}:{r['port']}\n")
           
           # 2. 纯IP列表
           with open('Test_ip/best_ip.txt', 'w') as f:
               for r in top:
                   f.write(f"{r['ip']}\n")
           
-          # 3. IP:默认端口#运营商
+          # 3. IP:默认端口
           with open('Test_ip/result_default_port.txt', 'w') as f:
               for r in top:
-                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}\n")
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}\n")
           
-          # 4. 分运营商
-          for isp in ['移动', '联通', '电信']:
-              ips = [r for r in top if r['isp'] == isp]
-              if ips:
-                  with open(f'Test_ip/best_{isp}.txt', 'w') as f:
-                      for r in ips[:100]:
+          # 4. 按测试模式分类
+          for mode in ['TCP', 'HTTP', 'DEBUG']:
+              mode_ips = [r for r in top if r['mode'] == mode]
+              if mode_ips:
+                  with open(f'Test_ip/best_{mode}.txt', 'w') as f:
+                      for r in mode_ips[:200]:
                           f.write(f"{r['ip']}:{r['port']}\n")
           
           # 5. CSV详情
           with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
               writer = csv.writer(f)
-              writer.writerow(['排名', 'IP', '端口', '运营商', '延迟(ms)', '丢包率(%)', '得分'])
+              writer.writerow(['排名', 'IP', '端口', '模式', '延迟(ms)', '丢包率(%)', '得分'])
               for i, r in enumerate(top, 1):
-                  writer.writerow([i, r['ip'], r['port'], r['isp'], 
+                  writer.writerow([i, r['ip'], r['port'], r['mode'], 
                                    f"{r['delay']:.1f}", f"{r['loss']:.1f}", f"{r['score']:.1f}"])
           
           print("")
@@ -418,13 +417,13 @@ jobs:
         run: |
           echo ""
           echo "=== 快速验证前5个IP ==="
-          head -5 Test_ip/result_IP.txt | while IFS=':#' read ip port isp; do
+          head -5 Test_ip/result_IP.txt | while IFS=':' read ip port; do
             if [ -n "$ip" ] && [ -n "$port" ]; then
               echo -n "测试 $ip:$port ... "
               if curl -s --connect-timeout 3 --max-time 5 \
                  -o /dev/null -w "%{http_code}" \
-                 --resolve speed.cloudflare.com:$port:$ip \
-                 http://speed.cloudflare.com:$port/__down 2>/dev/null | grep -q "200"; then
+                 --resolve cloudflare.com:$port:$ip \
+                 http://cloudflare.com:$port/cdn-cgi/trace 2>/dev/null | grep -q "200"; then
                 echo "✅ 可用"
               else
                 echo "⚠️ 无响应"
@@ -465,11 +464,10 @@ jobs:
               git add Test_ip/ -f
               
               TOTAL=$(wc -l < Test_ip/result_IP.txt)
-              MOBILE=$(grep -c "#移动$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
-              UNICOM=$(grep -c "#联通$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
-              TELECOM=$(grep -c "#电信$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              TCP_COUNT=$(grep -c ",TCP," Test_ip/result.csv 2>/dev/null || echo 0)
+              HTTP_COUNT=$(grep -c ",HTTP," Test_ip/result.csv 2>/dev/null || echo 0)
               
-              git commit -m "🔄 Update CF IPs [$(date +'%m-%d %H:%M')] - 移动:$MOBILE 联通:$UNICOM 电信:$TELECOM"
+              git commit -m "🔄 Update CF IPs [$(date +'%m-%d %H:%M')] - Total:$TOTAL (TCP:$TCP_COUNT HTTP:$HTTP_COUNT)"
               git push
               echo "✅ 已推送"
             else
@@ -492,7 +490,7 @@ jobs:
       # ===============================
       - name: Cleanup
         if: always()
-        run: rm -f all_ips.txt all_results.csv CloudflareST debug_*.csv
+        run: rm -f all_ips.txt all_results.csv CloudflareST *_result_*.csv debug_*.csv
 
       # ===============================
       # 摘要
@@ -500,12 +498,13 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "## 📊 CF IP 优选摘要"
+            echo "## 📊 CF IP 优选摘要 (TCP + HTTPing)"
             echo ""
             echo "| 项目 | 值 |"
             echo "|------|-----|"
             echo "| 执行时间 | $(date +'%Y-%m-%d %H:%M') |"
             echo "| 测试端口 | ${{ env.PORTS }} |"
+            echo "| 测试模式 | TCP + HTTPing |"
             echo "| 延迟线程(-n) | ${{ env.THREADS }} |"
             echo "| 测速次数(-t) | ${{ env.PING_COUNT }} |"
             echo "| 延迟上限(-tl) | ${{ env.MAX_LATENCY }}ms |"
@@ -513,8 +512,8 @@ jobs:
             echo "| 下载测速 | 已禁用(-dd) |"
             echo "| 输出数量 | $(wc -l < Test_ip/result_IP.txt 2>/dev/null || echo 0) |"
             echo ""
-            echo "### 🎯 前15个优选IP"
+            echo "### 🎯 前20个优选IP"
             echo '```'
-            head -15 Test_ip/result_IP.txt 2>/dev/null || echo "无数据"
+            head -20 Test_ip/result_IP.txt 2>/dev/null || echo "无数据"
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
