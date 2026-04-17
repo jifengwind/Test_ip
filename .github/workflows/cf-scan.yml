@@ -1,185 +1,775 @@
-name: CF IP Auto Select (Optimized Lite)
+# =============================================================================
+# CF IP Auto Select - 纯 CloudflareST 优化版
+# =============================================================================
+# 融合特性：
+#   ✅ 多端口并行测试 (443, 8443, 2053)
+#   ✅ 增强运营商识别 (内置规则 + 在线API)
+#   ✅ 智能融合排序算法 (延迟+丢包+稳定性)
+#   ✅ 自动持久化到仓库
+#   ✅ Artifact 备份
+#   ✅ 智能提交 (仅在有变化时提交)
+#   ✅ 健康检查验证
+#   ✅ 支持本地 CIDR 文件
+# =============================================================================
+
+name: CF IP Auto Select (Optimized)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 18 * * *'
+    - cron: '0 18 * * *'           # 每天北京时间 02:00 执行
 
 env:
-  SAMPLE_SIZE: 200000
-  OUTPUT_N: 5000
-  THREADS: 80
-  MAX_LATENCY: 500
-  FINAL_OUTPUT: 1500
-  MAX_LOSS: 5
-
-  PORTS: "443 8443 2053 2083 2087"
-  DEFAULT_PORT: 443
+  # -------------------- 抽样配置 --------------------
+  SAMPLE_SIZE: 150000               # 从 CIDR 中随机抽取的 IP 数量 (优化: 200k→150k)
+  
+  # -------------------- 延迟测试配置 --------------------
+  OUTPUT_N: 3000                    # 每个端口的 CloudflareST 输出数量 (优化: 5k→3k)
+  THREADS: 50                       # 并发线程数 (优化: 80→50)
+  MAX_LATENCY: 400                  # 延迟上限(ms) (优化: 500→400)
+  CONNECT_TIMEOUT: 2                # 连接超时(秒)
+  
+  # -------------------- 结果筛选配置 --------------------
+  FINAL_OUTPUT: 1500                # 最终保存的 IP 数量
+  MAX_LOSS: 3                       # 最大丢包率(%) (优化: 5%→3%)
+  MIN_STABILITY: 0.8                # 最低稳定性得分 (0-1)
+  
+  # -------------------- 端口配置 --------------------
+  PORTS: "443 8443 2053"           # 测试端口列表 (优化: 移除较少使用的2083)
+  DEFAULT_PORT: 443                 # 输出时使用的默认端口
+  
+  # -------------------- 其他配置 --------------------
+  MAX_RETRY: 2                      # 测试失败重试次数
+  ENABLE_ONLINE_ISP: true           # 是否启用在线ISP查询
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 45              # 优化: 55→45 (去掉masscan后更快)
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - run: mkdir -p Test_ip
+      - name: Install Dependencies
+        run: |
+          echo "=== 安装依赖 ==="
+          sudo apt-get update -qq
+          sudo apt-get install -y parallel curl
+          pip install requests ipaddress --quiet
+          echo "✅ 依赖安装完成"
 
-      # 下载 CFST
+      - name: Create Output Directory
+        run: mkdir -p Test_ip
+
+      # ===============================
+      # 缓存 CloudflareST
+      # ===============================
+      - name: Cache CloudflareST
+        uses: actions/cache@v4
+        with:
+          path: CloudflareST
+          key: cloudflarest-v2.2.5
+
       - name: Download CloudflareST
         run: |
-          wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
-          tar -xzf CloudflareST_linux_amd64.tar.gz
-          chmod +x CloudflareST
-
-      # CIDR
-      - name: Prepare CIDR
-        run: |
-          if [ -s ipv4cidr.txt ]; then
-            echo "使用本地CIDR"
-            cp ipv4cidr.txt all_cidr.txt
+          if [ ! -f CloudflareST ]; then
+            echo "=== 下载 CloudflareSpeedTest ==="
+            wget -q https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.2.5/CloudflareST_linux_amd64.tar.gz
+            tar -xzf CloudflareST_linux_amd64.tar.gz
+            chmod +x CloudflareST
+            rm CloudflareST_linux_amd64.tar.gz
+            echo "✅ 下载完成"
           else
-            echo "使用官方CIDR"
-            curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
+            echo "✅ 使用缓存的 CloudflareST"
           fi
 
-      # 抽样（优化版）
-      - name: Sample IPs
+      # ===============================
+      # 准备 CIDR 列表
+      # ===============================
+      - name: Prepare CIDR
         run: |
+          echo "=== 准备 CIDR 列表 ==="
+          
+          if [ -f ipv4cidr.txt ]; then
+            echo "✅ 使用本地 ipv4cidr.txt"
+            cp ipv4cidr.txt all_cidr.txt
+          else
+            echo "⚠️ 未找到 ipv4cidr.txt，使用官方 CIDR"
+            curl -s https://www.cloudflare.com/ips-v4/ -o all_cidr.txt
+          fi
+          
+          echo "CIDR 段数量: $(wc -l < all_cidr.txt)"
+
+      # ===============================
+      # 从 CIDR 中抽样 IP (优化版)
+      # ===============================
+      - name: Sample IPs from CIDR
+        run: |
+          echo "=== 从 CIDR 中随机抽取 ${{ env.SAMPLE_SIZE }} 个 IP ==="
+          
           python3 << 'EOF'
-          import ipaddress, random, os
-
-          SAMPLE_SIZE = int(os.environ['SAMPLE_SIZE'])
-          MAX_PER_CIDR = 500
-
+          import ipaddress
+          import random
+          import os
+          import bisect
+          
+          SAMPLE_SIZE = int(os.environ.get('SAMPLE_SIZE', 150000))
+          
+          # 读取 CIDR
           cidrs = []
-          for line in open('all_cidr.txt'):
+          with open('all_cidr.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      try:
+                          net = ipaddress.ip_network(line, strict=False)
+                          if net.num_addresses > 2:
+                              cidrs.append(net)
+                      except:
+                          pass
+          
+          print(f"有效 CIDR 段: {len(cidrs)}")
+          
+          # 计算权重 (按地址数量)
+          weights = [net.num_addresses - 2 for net in cidrs]
+          total_ips = sum(weights)
+          print(f"总可用 IP 数量: {total_ips:,}")
+          
+          # 优化: 预计算累积权重
+          cum_weights = []
+          total = 0
+          for w in weights:
+              total += w
+              cum_weights.append(total)
+          
+          # 抽样
+          sample_ips = set()
+          max_attempts = min(SAMPLE_SIZE * 5, total_ips)  # 优化: 减少最大尝试次数
+          attempts = 0
+          
+          while len(sample_ips) < SAMPLE_SIZE and attempts < max_attempts:
+              # 优化: 使用二分查找
+              r = random.randint(1, total)
+              idx = bisect.bisect_left(cum_weights, r)
+              net = cidrs[idx]
+              
+              # 避开网络地址和广播地址
+              ip_int = random.randint(1, net.num_addresses - 2)
+              sample_ips.add(str(net[ip_int]))
+              attempts += 1
+          
+          with open('all_ips.txt', 'w') as f:
+              for ip in sample_ips:
+                  f.write(ip + '\n')
+          
+          print(f"实际抽样: {len(sample_ips):,} 个 IP")
+          print(f"抽样效率: {len(sample_ips)/attempts*100:.1f}%")
+          EOF
+          
+          echo "待测试 IP 数量: $(wc -l < all_ips.txt)"
+
+      # ===============================
+      # 多端口并行延迟测试 (优化版)
+      # ===============================
+      - name: Multi-Port Parallel Latency Test
+        run: |
+          echo "=== 多端口并行延迟测试 ==="
+          echo "配置: 每端口输出=${{ env.OUTPUT_N }} | 延迟上限=${{ env.MAX_LATENCY }}ms | 线程=${{ env.THREADS }}"
+          echo "端口: ${{ env.PORTS }}"
+          
+          # 计算每个端口的线程数
+          PORT_COUNT=$(echo "${{ env.PORTS }}" | wc -w)
+          THREADS_PER_PORT=$((${{ env.THREADS }} / PORT_COUNT))
+          
+          # 清空汇总文件
+          > all_results.csv
+          
+          # 使用 GNU parallel 并行测试
+          echo "${{ env.PORTS }}" | tr ' ' '\n' | parallel -j $PORT_COUNT '
+            port={}
+            retry=0
+            max_retry=${{ env.MAX_RETRY }}
+            
+            echo ""
+            echo "=========================================="
+            echo "测试端口: $port (线程: '$THREADS_PER_PORT')"
+            echo "=========================================="
+            
+            while [ $retry -lt $max_retry ]; do
+              # 执行测试
+              ./CloudflareST \
+                -f all_ips.txt \
+                -n ${{ env.OUTPUT_N }} \
+                -t '$THREADS_PER_PORT' \
+                -tl ${{ env.MAX_LATENCY }} \
+                -tp ${{ env.CONNECT_TIMEOUT }} \
+                -httping \
+                -dd \
+                -sl 8 \
+                -p $port \
+                -o result_$port.csv 2>&1 | tail -15
+              
+              # 检查结果
+              if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
+                echo "✅ 端口 $port 测试成功，获得 $(tail -n +2 result_$port.csv | wc -l) 条结果"
+                break
+              fi
+              
+              retry=$((retry + 1))
+              if [ $retry -lt $max_retry ]; then
+                echo "⚠️ 端口 $port 测试失败，重试 $retry/$max_retry"
+                sleep 3
+              else
+                echo "❌ 端口 $port 测试失败，已达最大重试次数"
+              fi
+            done
+          '
+          
+          # 合并结果
+          echo ""
+          echo "=== 合并测试结果 ==="
+          FIRST_FILE=true
+          
+          for port in ${{ env.PORTS }}; do
+            if [ -f result_$port.csv ] && [ $(wc -l < result_$port.csv) -gt 1 ]; then
+              if [ "$FIRST_FILE" = true ]; then
+                head -1 result_$port.csv | sed 's/$/,测试端口/' > all_results.csv
+                FIRST_FILE=false
+              fi
+              tail -n +2 result_$port.csv | awk -v p="$port" '{print $0 "," p}' >> all_results.csv
+              echo "端口 $port: $(tail -n +2 result_$port.csv | wc -l) 条"
+              rm result_$port.csv
+            fi
+          done
+          
+          echo ""
+          TOTAL_RESULTS=$(tail -n +2 all_results.csv 2>/dev/null | wc -l)
+          echo "汇总结果总数: $TOTAL_RESULTS"
+          
+          if [ "$TOTAL_RESULTS" -eq 0 ]; then
+            echo "❌ 错误: 没有获得任何有效结果"
+            exit 1
+          fi
+
+      # ===============================
+      # 结果处理与智能融合 (优化版)
+      # ===============================
+      - name: Process and Merge Results
+        run: |
+          echo "=== 智能结果融合与评分 ==="
+          echo "配置: 最终输出=${{ env.FINAL_OUTPUT }} | 最大丢包=${{ env.MAX_LOSS }}% | 最低稳定性=${{ env.MIN_STABILITY }}"
+          
+          python3 << 'EOF'
+          import csv
+          import os
+          import requests
+          import time
+          from collections import defaultdict
+          from functools import lru_cache
+          
+          FINAL_OUTPUT = int(os.environ.get('FINAL_OUTPUT', 1500))
+          MAX_LOSS = float(os.environ.get('MAX_LOSS', 3))
+          DEFAULT_PORT = os.environ.get('DEFAULT_PORT', '443')
+          ENABLE_ONLINE_ISP = os.environ.get('ENABLE_ONLINE_ISP', 'true').lower() == 'true'
+          
+          # ISP 缓存
+          isp_cache = {}
+          
+          # ===============================
+          # 增强运营商识别
+          # ===============================
+          def quick_detect_isp(ip):
+              """快速内置规则识别"""
+              parts = ip.split('.')
+              if len(parts) != 4:
+                  return '多线'
+              
+              first, second = parts[0], parts[1]
+              
+              # 移动
+              if first == '104':
+                  if second in ['16', '17', '18', '19', '28', '29']:
+                      return '移动'
+              elif first == '162' and second == '159':
+                  return '移动'
+              elif first == '172':
+                  if second in ['64', '65', '66', '67', '68']:
+                      return '移动'
+              
+              # 联通
+              if first == '104':
+                  if second in ['20', '21', '22', '23', '24', '31']:
+                      return '联通'
+              elif first == '162' and second == '158':
+                  return '联通'
+              
+              # 电信
+              if first == '104':
+                  if second in ['25', '26', '27', '30']:
+                      return '电信'
+              elif first == '162' and second in ['159', '160']:
+                  return '电信'
+              elif first == '172':
+                  if second in ['69', '70']:
+                      return '电信'
+              
+              return '多线'
+          
+          def online_detect_isp(ip):
+              """在线API查询运营商"""
+              if not ENABLE_ONLINE_ISP:
+                  return '多线'
+              
+              if ip in isp_cache:
+                  return isp_cache[ip]
+              
               try:
-                  net = ipaddress.ip_network(line.strip(), False)
-                  if net.num_addresses > 10:
-                      cidrs.append(net)
+                  # 限流
+                  time.sleep(0.05)
+                  
+                  # 使用 ip-api.com (免费，无需API Key)
+                  resp = requests.get(
+                      f"http://ip-api.com/json/{ip}?fields=isp,status",
+                      timeout=3,
+                      headers={'User-Agent': 'Mozilla/5.0'}
+                  )
+                  
+                  if resp.status_code == 200:
+                      data = resp.json()
+                      if data.get('status') == 'success':
+                          isp_name = data.get('isp', '').lower()
+                          
+                          if any(k in isp_name for k in ['china mobile', 'cmnet', 'cmcc']):
+                              result = '移动'
+                          elif any(k in isp_name for k in ['china unicom', 'cucc', 'cnc']):
+                              result = '联通'
+                          elif any(k in isp_name for k in ['china telecom', 'ctc', 'chinanet']):
+                              result = '电信'
+                          elif 'cloudflare' in isp_name:
+                              result = '多线'
+                          else:
+                              result = '多线'
+                          
+                          isp_cache[ip] = result
+                          return result
               except:
                   pass
-
-          sample_ips = set()
-
-          for net in cidrs:
-              count = min(MAX_PER_CIDR, net.num_addresses - 2)
-              for _ in range(count):
-                  ip = net[random.randint(1, net.num_addresses - 2)]
-                  sample_ips.add(str(ip))
-                  if len(sample_ips) >= SAMPLE_SIZE:
-                      break
-              if len(sample_ips) >= SAMPLE_SIZE:
-                  break
-
-          open('all_ips.txt','w').write('\n'.join(sample_ips))
-          print("抽样完成:", len(sample_ips))
+              
+              return '多线'
+          
+          def detect_isp(ip):
+              """综合运营商识别"""
+              # 先尝试快速识别
+              quick_result = quick_detect_isp(ip)
+              if quick_result != '多线':
+                  return quick_result
+              
+              # 再尝试在线识别
+              return online_detect_isp(ip)
+          
+          # ===============================
+          # 增强评分算法
+          # ===============================
+          def calculate_stability(delays):
+              """计算稳定性得分 (基于延迟波动)"""
+              if len(delays) < 3:
+                  return 0.5
+              
+              avg = sum(delays) / len(delays)
+              variance = sum((d - avg) ** 2 for d in delays) / len(delays)
+              std_dev = variance ** 0.5
+              
+              # 变异系数
+              cv = std_dev / avg if avg > 0 else 1
+              
+              # 转换为 0-1 得分 (cv越小越好)
+              stability = max(0, 1 - cv * 10)
+              return min(1, stability)
+          
+          def calculate_score(delay, loss, stability=0.5):
+              """综合得分算法"""
+              # 延迟得分 (0-100)
+              delay_score = min(delay, 400) / 4
+              
+              # 丢包惩罚 (每1%丢包加10分)
+              loss_penalty = loss * 10
+              
+              # 稳定性奖励 (0-20分减免)
+              stability_bonus = stability * 20
+              
+              # 综合得分
+              score = delay_score + loss_penalty - stability_bonus
+              
+              return max(0, score)
+          
+          # ===============================
+          # 读取所有端口的结果
+          # ===============================
+          if not os.path.exists('all_results.csv') or os.path.getsize('all_results.csv') == 0:
+              print("❌ 没有测试结果")
+              with open('Test_ip/best_ip.txt', 'w') as f:
+                  f.write("# No results\n")
+              exit(1)
+          
+          # IP -> {port: (delay, loss, delays_list)} 的映射
+          ip_results = defaultdict(dict)
+          
+          with open('all_results.csv', 'r', encoding='utf-8') as f:
+              reader = csv.DictReader(f)
+              row_count = 0
+              
+              for row in reader:
+                  try:
+                      ip = row.get('IP 地址', '').strip()
+                      if not ip:
+                          continue
+                      
+                      delay = float(row.get('平均延迟', '0').strip() or '0')
+                      
+                      loss_str = row.get('丢包率', '0').strip().rstrip('%')
+                      loss = float(loss_str) if loss_str else 0
+                      
+                      # 获取延迟列表用于稳定性计算
+                      delays_str = row.get('延迟列表', '')
+                      if delays_str:
+                          delays_list = [float(d) for d in delays_str.split(',') if d.strip()]
+                      else:
+                          delays_list = [delay]
+                      
+                      port = row.get('测试端口', '').strip()
+                      if not port:
+                          port = row.get('端口', DEFAULT_PORT).strip()
+                      
+                      if loss <= MAX_LOSS and delay > 0 and delay <= float(os.environ.get('MAX_LATENCY', 400)):
+                          ip_results[ip][port] = (delay, loss, delays_list)
+                          row_count += 1
+                  except:
+                      continue
+          
+          print(f"读取有效结果: {row_count} 条")
+          print(f"涉及 IP 数量: {len(ip_results)}")
+          
+          # ===============================
+          # 计算每个 IP 的综合得分
+          # ===============================
+          final_results = []
+          MIN_STABILITY = float(os.environ.get('MIN_STABILITY', 0.8))
+          
+          for ip, ports_data in ip_results.items():
+              # 找到该 IP 的最佳端口
+              best_port = None
+              best_score = float('inf')
+              best_delay = 0
+              best_loss = 0
+              best_stability = 0
+              
+              for port, (delay, loss, delays_list) in ports_data.items():
+                  stability = calculate_stability(delays_list)
+                  score = calculate_score(delay, loss, stability)
+                  
+                  if score < best_score and stability >= MIN_STABILITY:
+                      best_score = score
+                      best_port = port
+                      best_delay = delay
+                      best_loss = loss
+                      best_stability = stability
+              
+              if best_port:
+                  isp = detect_isp(ip)
+                  
+                  final_results.append({
+                      'ip': ip,
+                      'best_port': best_port,
+                      'delay': best_delay,
+                      'loss': best_loss,
+                      'score': best_score,
+                      'stability': best_stability,
+                      'isp': isp,
+                      'all_ports': list(ports_data.keys())
+                  })
+          
+          # 按得分排序
+          final_results.sort(key=lambda x: (x['score'], -x['stability']))
+          
+          # 取前 N 个
+          top_results = final_results[:FINAL_OUTPUT]
+          
+          print(f"\n最终筛选出 {len(top_results)} 个 IP")
+          
+          # ===============================
+          # 显示结果
+          # ===============================
+          print("\n" + "=" * 85)
+          print(f"{'排名':<4} {'IP地址':<18} {'运营商':<6} {'端口':<6} {'延迟':<8} {'丢包%':<6} {'稳定性':<6} {'其他端口'}")
+          print("-" * 85)
+          
+          for i, r in enumerate(top_results[:30], 1):
+              other_ports = [p for p in r['all_ports'] if p != r['best_port']][:3]
+              other_str = ','.join(other_ports) if other_ports else '-'
+              print(f"{i:<4} {r['ip']:<18} {r['isp']:<6} {r['best_port']:<6} "
+                    f"{r['delay']:<8.1f} {r['loss']:<6.1f} {r['stability']:<6.2f} {other_str}")
+          
+          if len(top_results) > 30:
+              print(f"... 共 {len(top_results)} 条，仅显示前 30")
+          
+          # ===============================
+          # 统计分析
+          # ===============================
+          stats = {'电信': 0, '联通': 0, '移动': 0, '多线': 0}
+          port_stats = defaultdict(int)
+          delay_sum = {'电信': [], '联通': [], '移动': [], '多线': []}
+          
+          for r in top_results:
+              stats[r['isp']] += 1
+              port_stats[r['best_port']] += 1
+              delay_sum[r['isp']].append(r['delay'])
+          
+          print("\n=== 运营商分布 ===")
+          for isp, count in sorted(stats.items(), key=lambda x: -x[1]):
+              if count > 0:
+                  pct = count / len(top_results) * 100
+                  avg_delay = sum(delay_sum[isp]) / len(delay_sum[isp]) if delay_sum[isp] else 0
+                  print(f"  {isp}: {count}个 ({pct:.1f}%) 平均延迟: {avg_delay:.1f}ms")
+          
+          print("\n=== 最佳端口分布 ===")
+          for port, count in sorted(port_stats.items(), key=lambda x: -x[1]):
+              pct = count / len(top_results) * 100
+              print(f"  端口 {port}: {count}个 ({pct:.1f}%)")
+          
+          # ===============================
+          # 保存结果文件
+          # ===============================
+          
+          # 1. 纯 IP 列表
+          with open('Test_ip/best_ip.txt', 'w') as f:
+              for r in top_results:
+                  f.write(f"{r['ip']}\n")
+          
+          # 2. IP:端口#运营商 格式
+          with open('Test_ip/result_IP.txt', 'w') as f:
+              for r in top_results:
+                  f.write(f"{r['ip']}:{r['best_port']}#{r['isp']}\n")
+          
+          # 3. IP:默认端口#运营商 格式
+          with open('Test_ip/result_default_port.txt', 'w') as f:
+              for r in top_results:
+                  f.write(f"{r['ip']}:{DEFAULT_PORT}#{r['isp']}\n")
+          
+          # 4. 详细 CSV (增强版)
+          with open('Test_ip/result.csv', 'w', newline='', encoding='utf-8') as f:
+              writer = csv.writer(f)
+              writer.writerow(['排名', 'IP地址', '最佳端口', '运营商', '延迟(ms)', 
+                             '丢包率(%)', '稳定性', '综合得分', '其他可用端口'])
+              for i, r in enumerate(top_results, 1):
+                  other_ports = ','.join([p for p in r['all_ports'] if p != r['best_port']])
+                  writer.writerow([
+                      i, r['ip'], r['best_port'], r['isp'], 
+                      f"{r['delay']:.1f}", f"{r['loss']:.1f}", 
+                      f"{r['stability']:.2f}", f"{r['score']:.2f}", 
+                      other_ports
+                  ])
+          
+          # 5. 各运营商独立文件 (排序)
+          for isp in ['电信', '联通', '移动']:
+              isp_ips = [r for r in top_results if r['isp'] == isp]
+              if isp_ips:
+                  # 按得分排序
+                  isp_ips.sort(key=lambda x: x['score'])
+                  with open(f'Test_ip/best_{isp}.txt', 'w') as f:
+                      for r in isp_ips[:100]:
+                          f.write(f"{r['ip']}:{r['best_port']}\n")
+          
+          # 6. JSON 格式 (便于程序读取)
+          import json
+          with open('Test_ip/results.json', 'w') as f:
+              json.dump({
+                  'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                  'total': len(top_results),
+                  'results': top_results
+              }, f, indent=2, ensure_ascii=False)
+          
+          print("\n✅ 结果已保存到 Test_ip 目录")
+          print("  - best_ip.txt: 纯 IP 列表")
+          print("  - result_IP.txt: IP:最佳端口#运营商")
+          print("  - result.csv: 详细数据 (含稳定性得分)")
+          print("  - results.json: JSON格式完整数据")
+          print("  - best_电信.txt, best_联通.txt, best_移动.txt: 分运营商文件")
           EOF
 
-      # 多端口测速
-      - name: Multi-Port Test
+      # ===============================
+      # 健康检查优选 IP
+      # ===============================
+      - name: Health Check Top IPs
         run: |
-          > all_results.csv
-
-          for port in ${{ env.PORTS }}
-          do
-            echo "测试端口 $port"
-
-            ./CloudflareST \
-              -f all_ips.txt \
-              -n ${{ env.OUTPUT_N }} \
-              -t ${{ env.THREADS }} \
-              -tl ${{ env.MAX_LATENCY }} \
-              -httping \
-              -dd \
-              -sl 8 \
-              -p $port
-
-            if [ -f result.csv ]; then
-              if [ ! -s all_results.csv ]; then
-                head -1 result.csv | sed 's/$/,端口/' > all_results.csv
+          echo ""
+          echo "=== 健康检查前10个优选IP ==="
+          
+          if [ ! -f Test_ip/result_IP.txt ]; then
+            echo "❌ 没有结果文件"
+            exit 0
+          fi
+          
+          head -10 Test_ip/result_IP.txt | while IFS=':#' read ip port isp; do
+            if [ -n "$ip" ] && [ -n "$port" ]; then
+              echo -n "测试 $ip:$port ($isp) ... "
+              
+              # 使用 curl 测试连通性
+              HTTP_CODE=$(curl -s --connect-timeout 3 --max-time 5 \
+                           -o /dev/null -w "%{http_code}" \
+                           --resolve cloudflare.com:$port:$ip \
+                           http://cloudflare.com:$port/cdn-cgi/trace 2>/dev/null || echo "000")
+              
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "✅ 可用"
+              else
+                echo "⚠️ 响应码: $HTTP_CODE"
               fi
-              tail -n +2 result.csv | awk -v p="$port" '{print $0 "," p}' >> all_results.csv
             fi
           done
 
-      # 结果处理（强化版）
-      - name: Process Results
+      # ===============================
+      # 追踪 Cloudflare 边缘节点
+      # ===============================
+      - name: Trace Edge Location
         run: |
-          python3 << 'EOF'
-          import csv, os
-          from collections import defaultdict
+          echo ""
+          echo "=== Cloudflare 边缘节点信息 ==="
+          curl -s https://cloudflare.com/cdn-cgi/trace | grep -E "loc|colo|ip|http"
 
-          FINAL_OUTPUT = int(os.environ['FINAL_OUTPUT'])
-          MAX_LOSS = float(os.environ['MAX_LOSS'])
-
-          PORT_PRIORITY = {
-              "443": 1.0,
-              "8443": 0.97,
-              "2053": 0.93,
-              "2083": 0.90,
-              "2087": 0.88
-          }
-
-          ip_map = defaultdict(dict)
-
-          with open('all_results.csv','r',encoding='utf-8') as f:
-              for r in csv.DictReader(f):
-                  try:
-                      ip = r['IP 地址']
-                      delay = float(r['平均延迟'])
-                      loss = float(r['丢包率'].rstrip('%'))
-
-                      if loss > MAX_LOSS or delay <= 0:
-                          continue
-
-                      port = r.get('端口') or r.get('测试端口')
-
-                      score = delay * (1 + (loss/10)**2)
-                      score /= PORT_PRIORITY.get(port,0.8)
-
-                      ip_map[ip][port] = (score, delay, loss)
-                  except:
-                      pass
-
-          results = []
-
-          for ip, ports in ip_map.items():
-              best = min(ports.items(), key=lambda x: x[1][0])
-              port = best[0]
-              score, delay, loss = best[1]
-
-              results.append((ip, port, delay, loss, score))
-
-          results.sort(key=lambda x: x[4])
-          results = results[:FINAL_OUTPUT]
-
-          os.makedirs('Test_ip', exist_ok=True)
-
-          with open('Test_ip/result_IP.txt','w') as f:
-              for ip, port, *_ in results:
-                  f.write(f"{ip}:{port}\n")
-
-          print("完成:", len(results))
-          EOF
-
-      # 提交
-      - name: Commit
+      # ===============================
+      # 显示结果预览
+      # ===============================
+      - name: Show Results Preview
         run: |
-          git config user.name "github-actions"
-          git config user.email "action@github.com"
+          echo ""
+          echo "=========================================="
+          echo "📁 Test_ip 目录内容"
+          echo "=========================================="
+          ls -lh Test_ip/
+          echo ""
+          
+          if [ -f Test_ip/result_IP.txt ]; then
+            echo "=========================================="
+            echo "📊 统计信息"
+            echo "=========================================="
+            echo "总IP数: $(wc -l < Test_ip/result_IP.txt)"
+            
+            for isp in 电信 联通 移动 多线; do
+              COUNT=$(grep -c "#${isp}$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "  $isp: $COUNT 个"
+              fi
+            done
+            
+            echo ""
+            echo "=========================================="
+            echo "📄 前 20 个优选 IP"
+            echo "=========================================="
+            head -20 Test_ip/result_IP.txt
+          fi
 
-          git add Test_ip/ -f
-
-          if git diff --cached --quiet; then
-            echo "无更新"
+      # ===============================
+      # 智能提交到仓库
+      # ===============================
+      - name: Smart Commit and Push
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # 检查是否有实质性变化
+          if [ -f Test_ip/result_IP.txt ]; then
+            NEW_HASH=$(md5sum Test_ip/result_IP.txt | cut -d' ' -f1)
+            
+            # 获取旧版本哈希
+            OLD_HASH=$(git show HEAD:Test_ip/result_IP.txt 2>/dev/null | md5sum | cut -d' ' -f1 || echo "")
+            
+            if [ "$NEW_HASH" != "$OLD_HASH" ]; then
+              echo "✅ 检测到结果变化，准备提交"
+              
+              git add Test_ip/ -f
+              
+              # 生成提交信息
+              TOTAL=$(wc -l < Test_ip/result_IP.txt)
+              MOBILE=$(grep -c "#移动$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              UNICOM=$(grep -c "#联通$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              TELECOM=$(grep -c "#电信$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              
+              TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S')
+              git commit -m "🔄 Update CF IPs [${TIMESTAMP}]
+              
+              - Total: ${TOTAL} IPs
+              - 移动: ${MOBILE} | 联通: ${UNICOM} | 电信: ${TELECOM}
+              "
+              
+              git push
+              echo "✅ 已推送到仓库"
+            else
+              echo "⏭️ 结果无变化，跳过提交"
+            fi
           else
-            git commit -m "update cf ip"
-            git push
+            echo "⚠️ 没有结果文件"
+          fi
+
+      # ===============================
+      # 上传 Artifact (备用)
+      # ===============================
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-ip-results-${{ github.run_number }}
+          path: |
+            Test_ip/
+            all_results.csv
+          retention-days: 7
+
+      # ===============================
+      # 清理临时文件
+      # ===============================
+      - name: Cleanup Temp Files
+        if: always()
+        run: |
+          echo "=== 清理临时文件 ==="
+          rm -f all_ips.txt all_cidr.txt all_results.csv
+          rm -f result_*.csv
+          echo "✅ 清理完成"
+
+      # ===============================
+      # 生成执行摘要
+      # ===============================
+      - name: Generate Summary
+        run: |
+          echo "## 📊 CF IP 优选执行摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 数值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 执行时间 | $(date +'%Y-%m-%d %H:%M:%S') |" >> $GITHUB_STEP_SUMMARY
+          echo "| 抽样 IP 数 | ${{ env.SAMPLE_SIZE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 测试端口 | ${{ env.PORTS }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 最终输出 | ${{ env.FINAL_OUTPUT }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 最大丢包率 | ${{ env.MAX_LOSS }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| 延迟上限 | ${{ env.MAX_LATENCY }}ms |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f Test_ip/result_IP.txt ]; then
+            echo "### 📈 运营商分布" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            for isp in 移动 联通 电信 多线; do
+              COUNT=$(grep -c "#${isp}$" Test_ip/result_IP.txt 2>/dev/null || echo 0)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "$isp: $COUNT 个" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🎯 前 15 个优选 IP" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -15 Test_ip/result_IP.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           fi
