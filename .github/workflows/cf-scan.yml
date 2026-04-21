@@ -7,11 +7,12 @@ on:
 
 env:
   SAMPLE_SIZE: 40000
-  PROCESSES: 4            # 降低到 4
-  THREADS_PER_PROCESS: 40 # 降低到 40
+  PROCESSES: 4
+  THREADS_PER_PROCESS: 40
   TCP_TIMEOUT: 3
   MAX_LATENCY_FILTER: 9999
   PORT: 443
+  OUTPUT_DIR: Proxy_ip  # 新增：输出目录变量
 
 jobs:
   tcp-prescan:
@@ -21,6 +22,11 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Create Output Directory
+        run: |
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          echo "✅ 创建输出目录: ${{ env.OUTPUT_DIR }}"
 
       - name: Install Dependencies
         run: |
@@ -87,7 +93,7 @@ jobs:
           weighted_cidrs = []
           total_weight = 0
           for net in cidrs:
-              weight = min(net.num_addresses, 65536)  # ✅ 修复缩进
+              weight = min(net.num_addresses, 65536)
               weighted_cidrs.append((net, weight))
               total_weight += weight
 
@@ -127,7 +133,6 @@ jobs:
           echo "并发: ${{ env.PROCESSES }} 进程 x ${{ env.THREADS_PER_PROCESS }} 线程 = $((${{ env.PROCESSES }} * ${{ env.THREADS_PER_PROCESS }}))"
           echo "超时: ${{ env.TCP_TIMEOUT }}s"
           
-          # 设置系统限制（GitHub Actions 实际限制可能更低）
           ulimit -n 65535 2>/dev/null || echo "⚠️ ulimit 设置失败，使用默认值"
           
           parallel -j ${{ env.PROCESSES }} --timeout 2400 '
@@ -159,6 +164,11 @@ jobs:
           import glob
           import os
 
+          OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'Proxy_ip')
+          
+          # 确保输出目录存在
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+          
           ip_set = set()
           result_files = sorted(glob.glob('result_ip_part_*.csv'))
           
@@ -189,36 +199,75 @@ jobs:
           live_ips = list(ip_set)
           print(f"✅ 去重后存活 IP 总数: {len(live_ips)}")
           
-          with open('live_cf_ips.txt', 'w') as f:
+          # 输出到 Proxy_ip 目录
+          live_ips_path = os.path.join(OUTPUT_DIR, 'live_cf_ips.txt')
+          live_ips_port_path = os.path.join(OUTPUT_DIR, 'live_cf_ips_443.txt')
+          
+          with open(live_ips_path, 'w') as f:
               for ip in live_ips:
                   f.write(ip + '\n')
                   
-          with open('live_cf_ips_443.txt', 'w') as f:
+          with open(live_ips_port_path, 'w') as f:
               for ip in live_ips:
                   f.write(f"{ip}:443\n")
+                  
+          print(f"✅ 结果已保存到 {OUTPUT_DIR}/ 目录")
           EOF
+
+      - name: List Output Files
+        run: |
+          echo "=== 输出文件列表 ==="
+          ls -lh ${{ env.OUTPUT_DIR }}/
+          echo ""
+          echo "=== 文件内容预览 ==="
+          head -5 ${{ env.OUTPUT_DIR }}/live_cf_ips.txt 2>/dev/null || echo "文件为空"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: cf-live-ips-${{ github.run_number }}
-          path: |
-            live_cf_ips.txt
-            live_cf_ips_443.txt
+          path: ${{ env.OUTPUT_DIR }}/
           retention-days: 14
           if-no-files-found: warn
 
+      - name: Commit and Push Results (Optional)
+        if: github.event_name != 'pull_request'
+        run: |
+          # 配置 Git
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          # 添加输出文件
+          git add ${{ env.OUTPUT_DIR }}/live_cf_ips.txt
+          git add ${{ env.OUTPUT_DIR }}/live_cf_ips_443.txt
+          
+          # 检查是否有变更
+          if git diff --cached --quiet; then
+            echo "📝 没有新的变更，跳过提交"
+          else
+            # 提交并推送
+            git commit -m "📊 Update CF live IPs - $(date +'%Y-%m-%d') [skip ci]"
+            git push
+            echo "✅ 结果已推送到仓库"
+          fi
+        continue-on-error: true
+
       - name: Show Summary
         run: |
-          TOTAL=$(wc -l < live_cf_ips.txt 2>/dev/null || echo 0)
+          TOTAL=$(wc -l < ${{ env.OUTPUT_DIR }}/live_cf_ips.txt 2>/dev/null || echo 0)
           echo "=========================================="
           echo "📊 TCP 预筛选结果"
           echo "=========================================="
+          echo "输出目录: ${{ env.OUTPUT_DIR }}"
           echo "存活 IP 数量: $TOTAL"
           echo ""
           if [ "$TOTAL" -gt 0 ]; then
             echo "示例 IP (前 10 个):"
-            head -10 live_cf_ips.txt
+            head -10 ${{ env.OUTPUT_DIR }}/live_cf_ips.txt
+            echo ""
+            echo "📁 文件位置:"
+            echo "  - ${{ env.OUTPUT_DIR }}/live_cf_ips.txt"
+            echo "  - ${{ env.OUTPUT_DIR }}/live_cf_ips_443.txt"
           else
             echo "⚠️ 未找到存活 IP"
           fi
